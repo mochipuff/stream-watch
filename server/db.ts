@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { MAX_INTERVAL_MS, MIN_INTERVAL_MS } from "../shared/contract.ts";
+import { MAX_INTERVAL_MS, MIN_INTERVAL_MS, ROLE_ID_RE } from "../shared/contract.ts";
 
 export const DB_FILE = resolve(process.env.DB_PATH || "data/app.db");
 mkdirSync(dirname(DB_FILE), { recursive: true });
@@ -67,6 +67,9 @@ addColumnIfMissing("channels", "youtube_id", "TEXT");
 addColumnIfMissing("channels", "name", "TEXT");
 addColumnIfMissing("channels", "source", "TEXT");
 addColumnIfMissing("channels", "live_count", "INTEGER NOT NULL DEFAULT 0");
+// Custom Discord message per handle (`{user}`, `@{roleid}` placeholders) and the role ids it may mention, comma-separated.
+addColumnIfMissing("channels", "message", "TEXT");
+addColumnIfMissing("channels", "role_ids", "TEXT NOT NULL DEFAULT ''");
 
 db.exec(`
 CREATE INDEX IF NOT EXISTS sent_streams_sent_at_idx ON sent_streams (sent_at DESC);
@@ -106,6 +109,9 @@ export function getIntervalMs(): number {
   const ms = candidates.find((n) => Number.isFinite(n) && n > 0) ?? DEFAULT_INTERVAL_MS;
   return Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, ms));
 }
+
+// Stored as "id,id"; anything that is not a role id is dropped on read, so a damaged row can never inject a mention.
+export const parseRoleIds = (raw: string | null): string[] => (raw ?? "").split(",").filter((id) => ROLE_ID_RE.test(id));
 
 export const isAutoEnabled = () => getSetting("auto") !== "0";
 

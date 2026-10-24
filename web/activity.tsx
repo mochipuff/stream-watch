@@ -34,7 +34,7 @@ export function ActivitySection() {
   const entries = log.data?.pages.flatMap((p) => p.items) ?? [];
 
   return (
-    <Section title="Activity log" hint="Changes, checks, sends and problems. The newest 2000 entries are kept. Secrets are never written here.">
+    <Section title="Activity log" hint="Changes, checks, sends and problems. Only the newest 15 entries of each level (info, warnings, errors) are kept. Secrets are never written here.">
       <ChipGroup
         label="Filter by level"
         value={level}

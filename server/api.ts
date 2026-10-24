@@ -8,7 +8,7 @@ import { MAX_CHANNELS, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts"
 import type { StreamStatus } from "../shared/contract.ts";
 import { audit, readAudit } from "./audit.ts";
 import { ADMIN_TOKEN, errorMessage, hostAllowed } from "./config.ts";
-import { query, setSetting, tx } from "./db.ts";
+import { parseRoleIds, query, setSetting, tx } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
 import { configureProxy, proxyStatus } from "./http.ts";
@@ -80,6 +80,8 @@ const channelRow = query<{ handle: string; enabled: number }>("SELECT handle, en
 const handleTaken = query("SELECT 1 FROM channels WHERE handle = ? COLLATE NOCASE");
 const insertChannel = query("INSERT INTO channels (id, handle) VALUES (?, ?)");
 const setChannelEnabled = query("UPDATE channels SET enabled = ? WHERE id = ?");
+const setChannelMessage = query("UPDATE channels SET message = ? WHERE id = ?");
+const setChannelRoles = query("UPDATE channels SET role_ids = ? WHERE id = ?");
 const deleteChannel = query("DELETE FROM channels WHERE id = ?"); // links go with it (ON DELETE CASCADE)
 const clearLinks = query("DELETE FROM channel_webhooks WHERE channel_id = ?");
 const insertLink = query("INSERT OR IGNORE INTO channel_webhooks (channel_id, webhook_id) VALUES (?, ?)");
@@ -99,8 +101,10 @@ const resendRow = query<{
   url: string;
   webhook_name: string;
   handle: string | null;
+  message: string | null;
+  role_ids: string | null;
 }>(
-  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle
+  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle, c.message, c.role_ids
    FROM sent_streams s
    JOIN webhooks w ON w.id = s.webhook_id
    LEFT JOIN channels c ON c.id = s.channel_id
@@ -167,12 +171,15 @@ app.patch("/api/channels/:id", async (c) => {
     if (!current) throw HttpError(404, "Channel not found");
     if (body.enabled !== undefined) setChannelEnabled.run(body.enabled ? 1 : 0, id);
     if (body.webhookIds) setLinks(id, body.webhookIds);
+    if (body.message !== undefined) setChannelMessage.run(body.message, id);
+    if (body.roleIds) setChannelRoles.run(body.roleIds.join(","), id);
     return current;
   });
   if (body.enabled !== undefined && body.enabled !== Boolean(row.enabled)) {
     audit("info", body.enabled ? "channel.resumed" : "channel.paused", `${body.enabled ? "Resumed" : "Paused"} ${row.handle}`);
   }
   if (body.webhookIds) audit("info", "channel.webhooks", `${row.handle} now sends to ${body.webhookIds.length} webhook(s)`);
+  if (body.message !== undefined || body.roleIds) audit("info", "channel.message", `Updated the message settings of ${row.handle}`);
   return changed(c);
 });
 
@@ -267,6 +274,8 @@ app.post("/api/sent/:webhookId/:videoId/resend", async (c) => {
         handle: row.handle,
         video: { videoId, title: row.title, status: row.status, startAt: row.start_at },
         thumbnail: await thumbnailFor(videoId),
+        message: row.message,
+        roleIds: parseRoleIds(row.role_ids),
       }),
     );
   } catch (err) {

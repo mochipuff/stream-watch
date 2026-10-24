@@ -165,154 +165,83 @@ function extractInitialData(html: string): unknown {
   );
 }
 
-// ---------- Tab /streams Scraper (Primary Discovery for Upcoming & Live) ----------
+// ---------- Tab /streams scraper (discovery only) ----------
+// The tab only suggests which videos MIGHT be live or upcoming. Past streams sit in the same list and YouTube's markup
+// changes often, so every candidate is confirmed through its watch page (`classifyByPages`) before anything is sent.
 
-function extractStreamsFromInitialData(data: unknown): Stream[] {
-  const streams: Stream[] = [];
-  const seen = new Set<string>();
+type Json = Record<string, any>;
 
-  function walk(node: unknown) {
+// Titles and other free text must never decide anything: a title like "ALIVE" or "[LIVE] replay" is not a live badge.
+const FREE_TEXT_KEYS = new Set([
+  "title",
+  "accessibility",
+  "accessibilityText",
+  "descriptionSnippet",
+  "detailedMetadataSnippets",
+  "headline",
+  "ownerText",
+  "longBylineText",
+  "shortBylineText",
+]);
+const LIVE_SIGNAL = /"style":"LIVE"|BADGE_STYLE_TYPE_LIVE_NOW|OVERLAY_BADGE_STYLE_LIVE|"imageName":"LIVE"|"isLive":true|\bwatching\b/;
+const UPCOMING_SIGNAL = /upcomingEventData|"style":"UPCOMING"|BADGE_STYLE_UPCOMING|\bScheduled for\b|\bPremieres\b/;
+
+function looksLiveOrUpcoming(renderer: Json): boolean {
+  const text = JSON.stringify(renderer, (key, value: unknown) => (FREE_TEXT_KEYS.has(key) ? undefined : value));
+  return LIVE_SIGNAL.test(text) || UPCOMING_SIGNAL.test(text);
+}
+
+function candidatesFromInitialData(data: unknown): string[] {
+  const ids = new Set<string>();
+  const found = (id: unknown, renderer: Json | undefined) => {
+    if (typeof id === "string" && VIDEO_ID_RE.test(id) && renderer && looksLiveOrUpcoming(renderer)) ids.add(id);
+  };
+  const walk = (node: unknown) => {
     if (!node || typeof node !== "object") return;
     if (Array.isArray(node)) {
       for (const item of node) walk(item);
       return;
     }
-    const obj = node as Record<string, unknown>;
-
-    // Handle traditional videoRenderer / gridVideoRenderer
-    const v = (obj.videoRenderer ?? obj.gridVideoRenderer ?? obj.richItemRenderer?.content?.videoRenderer) as Record<string, any> | undefined;
-    if (v && typeof v.videoId === "string" && VIDEO_ID_RE.test(v.videoId)) {
-      const vid = v.videoId;
-      if (!seen.has(vid)) {
-        const title =
-          v.title?.runs?.[0]?.text ??
-          v.title?.simpleText ??
-          "Untitled stream";
-
-        const upcomingData = v.upcomingEventData as { startTime?: string } | undefined;
-        const badgesStr = JSON.stringify(v.badges ?? []);
-        const overlaysStr = JSON.stringify(v.thumbnailOverlays ?? []);
-
-        const isUpcoming =
-          Boolean(upcomingData?.startTime) ||
-          badgesStr.includes("UPCOMING") ||
-          overlaysStr.includes("UPCOMING") ||
-          JSON.stringify(v).includes("upcomingEventData");
-
-        const isLive =
-          !isUpcoming &&
-          (badgesStr.includes("LIVE") || overlaysStr.includes("LIVE") || JSON.stringify(v).includes('"isLive":true'));
-
-        if (isUpcoming) {
-          seen.add(vid);
-          const startAt = upcomingData?.startTime ? Number(upcomingData.startTime) : null;
-          streams.push({
-            videoId: vid,
-            title,
-            status: "upcoming",
-            startAt: Number.isFinite(startAt) && (startAt ?? 0) > 0 ? startAt : null,
-          });
-        } else if (isLive) {
-          seen.add(vid);
-          streams.push({ videoId: vid, title, status: "live", startAt: null });
-        }
-      }
-    }
-
-    // Handle lockupViewModel
-    const lockup = obj.lockupViewModel as Record<string, any> | undefined;
-    if (lockup && typeof lockup.contentId === "string" && VIDEO_ID_RE.test(lockup.contentId)) {
-      const vid = lockup.contentId;
-      if (!seen.has(vid)) {
-        const lockupStr = JSON.stringify(lockup);
-        const isUpcoming = lockupStr.includes("UPCOMING") || lockupStr.includes("upcomingEventData");
-        const isLive = !isUpcoming && lockupStr.includes("LIVE");
-        if (isUpcoming || isLive) {
-          seen.add(vid);
-          const title =
-            lockup.metadata?.lockupMetadataViewModel?.title?.content ??
-            "Untitled stream";
-          const matchTime = /"startTime":"(\d+)"/.exec(lockupStr);
-          const startAt = matchTime ? Number(matchTime[1]) : null;
-          streams.push({
-            videoId: vid,
-            title,
-            status: isUpcoming ? "upcoming" : "live",
-            startAt: isUpcoming && Number.isFinite(startAt) && (startAt ?? 0) > 0 ? startAt : null,
-          });
-        }
-      }
-    }
-
-    for (const val of Object.values(obj)) {
-      walk(val);
-    }
-  }
-
+    const obj = node as Json;
+    found(obj.videoRenderer?.videoId, obj.videoRenderer);
+    found(obj.gridVideoRenderer?.videoId, obj.gridVideoRenderer);
+    found(obj.lockupViewModel?.contentId, obj.lockupViewModel);
+    for (const value of Object.values(obj)) walk(value);
+  };
   walk(data);
-  return streams;
+  return [...ids].slice(0, MAX_CANDIDATES);
 }
 
-function extractStreamsFromHtml(html: string): Stream[] {
-  const streams: Stream[] = [];
-  const seen = new Set<string>();
-
-  const upcomingRe = /"videoId":"([\w-]{11})"[^}]+?"upcomingEventData":\{"startTime":"(\d+)"/g;
-  let match: RegExpExecArray | null;
-  while ((match = upcomingRe.exec(html)) !== null) {
-    const videoId = match[1]!;
-    const startTime = Number(match[2]);
-    if (!seen.has(videoId) && VIDEO_ID_RE.test(videoId)) {
-      seen.add(videoId);
-      streams.push({
-        videoId,
-        title: "Upcoming stream",
-        status: "upcoming",
-        startAt: Number.isFinite(startTime) && startTime > 0 ? startTime : null,
-      });
-    }
-  }
-
-  const liveRe = /"videoId":"([\w-]{11})"[^}]+?"style":"LIVE"/g;
-  while ((match = liveRe.exec(html)) !== null) {
-    const videoId = match[1]!;
-    if (!seen.has(videoId) && VIDEO_ID_RE.test(videoId)) {
-      seen.add(videoId);
-      streams.push({ videoId, title: "Live stream", status: "live", startAt: null });
-    }
-  }
-
-  return streams;
+// Last resort when the page has no readable ytInitialData.
+function candidatesFromHtml(html: string): string[] {
+  const ids = new Set<string>();
+  for (const match of html.matchAll(/"videoId":"([\w-]{11})"[^}]{1,1500}?(?:"upcomingEventData"|"style":"LIVE")/g)) ids.add(match[1]!);
+  return [...ids].slice(0, MAX_CANDIDATES);
 }
 
-async function fetchStreamsFromTab(handleOrChannelId: string): Promise<Stream[]> {
-  const isChannelId = handleOrChannelId.startsWith("UC") && handleOrChannelId.length === 24;
-  const base = isChannelId
+async function fetchTabCandidates(handleOrChannelId: string): Promise<string[]> {
+  const base = CHANNEL_ID_RE.test(handleOrChannelId)
     ? `https://www.youtube.com/channel/${handleOrChannelId}`
-    : `https://www.youtube.com/${handleOrChannelId.startsWith("@") ? handleOrChannelId : "@" + handleOrChannelId}`;
-  const urls = [
-    `${base}/streams`,
-    `${base}/videos?view=0&sort=dd&live_view=501`,
-    `${base}/videos?view=0&sort=dd&live_view=502`,
-    isChannelId ? `https://www.youtube.com/${handleOrChannelId}/streams` : `${base}/live`,
-  ];
+    : `https://www.youtube.com/${handleOrChannelId.startsWith("@") ? handleOrChannelId : `@${handleOrChannelId}`}`;
+  // Listing pages only. `/live` is deliberately absent: it answers with the watch page of the channel's latest
+  // stream, even when that stream ended long ago.
+  const urls = [`${base}/streams`, `${base}/videos?view=0&sort=dd&live_view=501`, `${base}/videos?view=0&sort=dd&live_view=502`];
 
   let lastError: unknown;
   for (const url of urls) {
     try {
-      const html = await getHtml(url, (h) => extractInitialData(h) !== null, 3_000_000);
+      const html = await getHtml(url, (h) => extractInitialData(h) !== null, CHANNEL_PAGE_MAX_CHARS);
       const data = extractInitialData(html);
-      if (data) {
-        const streams = extractStreamsFromInitialData(data);
-        if (streams.length > 0) return streams;
-      }
-      const fallback = extractStreamsFromHtml(html);
+      // A listing that loaded and shows nothing live or upcoming is a valid answer: the other tabs are not requested.
+      if (data) return candidatesFromInitialData(data);
+      const fallback = candidatesFromHtml(html);
       if (fallback.length > 0) return fallback;
     } catch (err) {
       lastError = err;
     }
   }
-  throw lastError ?? new Error("No streams found on YouTube tabs");
+  if (lastError) throw lastError;
+  return [];
 }
 
 // ---------- Source 1: RSS Feed & Watch Page Classification ----------
@@ -367,38 +296,27 @@ function classifyPlayer(html: string, videoId: string): Stream | null {
   if (video?.videoId && video.videoId !== videoId) return null;
 
   const live = microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
-  // If the stream already ended, it's not live or upcoming
+  // A stream that already ended is a plain video (VOD), whatever else the page says.
   if (live?.endTimestamp) return null;
 
   const title = video?.title || "Untitled stream";
+  const startAt = toUnix(live?.startTimestamp);
 
-  // Check if live now
-  if (live?.isLiveNow || video?.isLive) {
-    return {
-      videoId,
-      title,
-      status: "live",
-      startAt: toUnix(live?.startTimestamp),
-    };
+  // An explicit `isLiveNow: false` wins over a leftover `isLive` flag.
+  if (live?.isLiveNow ?? video?.isLive) return { videoId, title, status: "live", startAt };
+
+  // `isUpcoming` / LIVE_STREAM_OFFLINE are the real signals. The weaker hints (a live-streamability block, a start time)
+  // also exist on finished streams, so they only count while the start time is still ahead.
+  const scheduled = Boolean(video?.isUpcoming) || playabilityStatus?.status === "LIVE_STREAM_OFFLINE";
+  const hinted = (Boolean(playabilityStatus?.liveStreamability) || startAt !== null) && (startAt === null || startAt > nowSec());
+  if (!scheduled && !hinted) return null;
+
+  let upcomingAt = startAt;
+  if (!upcomingAt) {
+    const matchStart = /"upcomingEventData":\{"startTime":"(\d+)"/.exec(html);
+    if (matchStart) upcomingAt = Number(matchStart[1]);
   }
-
-  // Check if upcoming
-  const isUpcoming =
-    Boolean(video?.isUpcoming) ||
-    playabilityStatus?.status === "LIVE_STREAM_OFFLINE" ||
-    Boolean(playabilityStatus?.liveStreamability) ||
-    Boolean(live?.startTimestamp && !live.isLiveNow);
-
-  if (isUpcoming) {
-    let startAt = toUnix(live?.startTimestamp);
-    if (!startAt) {
-      const matchStart = /"upcomingEventData":\{"startTime":"(\d+)"/.exec(html);
-      if (matchStart) startAt = Number(matchStart[1]);
-    }
-    return { videoId, title, status: "upcoming", startAt };
-  }
-
-  return null;
+  return { videoId, title, status: "upcoming", startAt: upcomingAt };
 }
 
 async function classifyByPages(videoIds: string[]): Promise<Stream[]> {
@@ -520,45 +438,30 @@ async function readFeed(channelId: string): Promise<{ channelName: string | null
 async function viaRss(channel: ChannelRef): Promise<Lookup> {
   const channelId = channel.youtubeId ?? (await resolveChannelId(channel.handle));
 
-  // 1. Fetch upcoming & live streams from YouTube tabs. These pages are the only source that can show
-  //    far-future scheduled broadcasts that are not in the recent uploads feed yet.
-  let tabStreams: Stream[] = [];
+  // 1. Discovery: the /streams tab is the only source that shows far-future scheduled broadcasts that are not in the
+  //    recent uploads feed yet. It only nominates candidates; it never decides what is live.
+  let tabIds: string[] = [];
   try {
-    tabStreams = await fetchStreamsFromTab(channel.handle || channelId);
+    tabIds = await fetchTabCandidates(channel.handle || channelId);
   } catch {
-    if (channelId) {
-      try {
-        tabStreams = await fetchStreamsFromTab(channelId);
-      } catch {
-        // Fall back to RSS feed
-      }
+    try {
+      tabIds = await fetchTabCandidates(channelId);
+    } catch {
+      // The RSS feed alone still covers recent uploads
     }
   }
 
-  for (const s of tabStreams) {
-    remember(s.videoId, s);
-  }
-
-  // 2. Fetch recent uploads & active broadcasts from RSS feed
+  // 2. Recent uploads & active broadcasts from the RSS feed
   const feed = await readFeed(channelId);
 
-  // 3. Classify any videoIds from feed that were not seen in /streams tab
-  const tabIds = new Set(tabStreams.map((s) => s.videoId));
-  const remainingIds = feed.videoIds.filter((id) => !tabIds.has(id));
-  const pageStreams = await classifyByPages(remainingIds);
-
-  const allStreams: Stream[] = [...tabStreams];
-  for (const s of pageStreams) {
-    if (!tabIds.has(s.videoId)) {
-      allStreams.push(s);
-    }
-  }
+  // 3. The watch page is the single authority: candidates from the tab come first, then the feed.
+  const streams = await classifyByPages([...new Set([...tabIds, ...feed.videoIds])]);
 
   return {
     channelId,
     channelName: feed.channelName ?? channel.name ?? channel.handle,
     source: "rss",
-    streams: allStreams,
+    streams,
   };
 }
 

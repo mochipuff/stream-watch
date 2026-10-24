@@ -21,7 +21,7 @@ The poller lives in the API process, not in the browser: closing the dashboard t
 
 ## How channels are checked
 
-1. **RSS feed** (default, no key): the channel's `feeds/videos.xml` lists recent videos. YouTube sometimes answers this endpoint with a short-lived 404 or 5xx, so one retry follows, then the channel's live-streams playlist feed (`playlist_id=UULV…`) is tried before the check counts as failed. Each new video is classified as `live`, `upcoming` or plain from its watch page. Plain videos are remembered in the database and never loaded again; live and upcoming ones are re-read every 5 minutes.
+1. **RSS feed** (default, no key): the channel's `feeds/videos.xml` lists recent videos. YouTube sometimes answers this endpoint with a short-lived 404 or 5xx, so one retry follows, then the channel's live-streams playlist feed (`playlist_id=UULV…`) is tried before the check counts as failed. The channel's `/streams` tab only nominates candidates (it is matched on badges and view counts, never on titles, and the channel's `/live` page is not used because it shows the latest stream even when it ended long ago). Every candidate and every feed video is then confirmed from its own watch page and classified as `live`, `upcoming` or plain; a stream with an end time is always plain, so an old VOD is never announced as live. Plain videos are remembered in the database and never loaded again; live and upcoming ones are re-read every 5 minutes.
 2. **YouTube Data API v3** (fallback, needs `YOUTUBE_API_KEY` in `.env`): used only when the RSS path fails. It reads the uploads playlist and classifies the videos with `liveBroadcastContent`. The key is sent in a header, never in a URL. When the quota is used up, the API is paused for 1 hour.
 
 The dashboard shows which source answered for each channel. The channel id (UC…) is resolved once and stored.
@@ -30,9 +30,11 @@ The dashboard shows which source answered for each channel. The channel id (UC�
 
 **Automatic cycle and manual check**: automatic checks can be turned off. "Check now" (and "Check" on one channel) works either way, ignores the failure back-off, and still never sends the same stream to the same webhook twice. Manual checks are limited to one every 5 seconds.
 
+**Message per channel**: the "Message" button on a channel sets text that is sent above the embed for that handle only. `{user}` becomes the handle (for example `@MizuHamzazu`) and `@{roleid}` becomes a mention of every role id saved for that handle (up to 10, each 17 to 20 digits). Example: `@{roleid} {user} is live!`. Only the saved roles can ping, and only when the message contains `@{roleid}`; `@everyone`, `@here` and other role ids typed by hand never notify anyone. Messages are up to 1000 characters; an empty message sends the embed alone. Existing databases get the two new columns automatically on start.
+
 **Channel list**: search by handle or name, filter by All / Active / Paused / Error, 10 per page. At most 500 channels.
 
-**Activity log**: changes, checks, sends, source and proxy fallbacks, and errors. The newest 2000 entries are kept. Webhook tokens, proxy passwords and API keys are removed before anything is written.
+**Activity log**: changes, checks, sends, source and proxy fallbacks, and errors. Each level (info, warning, error) keeps only its newest 15 entries, so an error is never pushed out by a burst of info lines. Older entries are deleted automatically, including on the first start after this limit was introduced. Webhook tokens, proxy passwords and API keys are removed before anything is written.
 
 ## How it fits together
 

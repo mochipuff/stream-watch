@@ -1,4 +1,5 @@
 import { memo, useDeferredValue, useMemo, useState } from "react";
+import { MAX_MESSAGE_LENGTH } from "../shared/contract.ts";
 import type { ChannelDto, WebhookDto } from "../shared/contract.ts";
 import { api, useAction } from "./api.ts";
 import { ChipGroup, ConfirmButton, Dialog, RelativeTime, Row, Section, buttonCls, inputCls, quietCls } from "./ui.tsx";
@@ -114,18 +115,67 @@ function ChannelWebhooksDialog({ channel, webhooks, onClose }: { channel: Channe
   );
 }
 
+function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClose: () => void }) {
+  const [message, setMessage] = useState(channel.message ?? "");
+  const [roles, setRoles] = useState(channel.roleIds.join("\n"));
+  const save = useAction(() =>
+    api.patchChannel(channel.id, { message: message.trim() || null, roleIds: roles.split(/[\s,]+/).filter(Boolean) }),
+  );
+
+  return (
+    <Dialog
+      title={`Message for ${channel.handle}`}
+      hint="Sent above the embed. {user} becomes the handle, @{roleid} mentions every role below. Leave empty to send the embed only."
+      onClose={onClose}
+    >
+      <label className="mt-4 block text-xs font-semibold text-muted" htmlFor="channel-message">
+        Message
+      </label>
+      <textarea
+        id="channel-message"
+        className={`${inputCls} mt-1 w-full`}
+        rows={4}
+        maxLength={MAX_MESSAGE_LENGTH}
+        placeholder="@{roleid} {user} is streaming!"
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+      />
+      <label className="mt-3 block text-xs font-semibold text-muted" htmlFor="channel-roles">
+        Role IDs to mention (one per line)
+      </label>
+      <textarea
+        id="channel-roles"
+        className={`${inputCls} mt-1 w-full font-mono`}
+        rows={3}
+        spellCheck={false}
+        value={roles}
+        onChange={(e) => setRoles(e.target.value)}
+      />
+      <div className="mt-5 flex justify-end gap-2">
+        <button className={quietCls} onClick={onClose}>
+          Cancel
+        </button>
+        <button className={buttonCls} disabled={save.isPending} onClick={() => save.mutate(undefined, { onSuccess: onClose })}>
+          Save
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
 interface ChannelRowProps {
   channel: ChannelDto;
   activeHooks: number;
   busy: boolean;
   checkBlocked: boolean;
   onEdit: (id: string) => void;
+  onMessage: (id: string) => void;
   onCheck: (id: string) => void;
   onToggle: (v: { id: string; enabled: boolean }) => void;
   onRemove: (id: string) => void;
 }
 
-const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkBlocked, onEdit, onCheck, onToggle, onRemove }: ChannelRowProps) {
+const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkBlocked, onEdit, onMessage, onCheck, onToggle, onRemove }: ChannelRowProps) {
   const total = channel.webhookIds.length;
   return (
     <Row
@@ -138,6 +188,12 @@ const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkB
             className="shrink-0 cursor-pointer rounded border border-line bg-paper px-2 py-0.5 text-[11px] font-normal text-muted hover:text-ink"
           >
             {total === 0 ? "⚠ No webhooks" : `${total} webhook${total > 1 ? "s" : ""}`}
+          </button>
+          <button
+            onClick={() => onMessage(channel.id)}
+            className="shrink-0 cursor-pointer rounded border border-line bg-paper px-2 py-0.5 text-[11px] font-normal text-muted hover:text-ink"
+          >
+            {channel.message ? "Message ✓" : "Message"}
           </button>
         </span>
       }
@@ -195,6 +251,7 @@ function Pagination({ page, pageCount, total, onPage }: { page: number; pageCoun
 
 export const ChannelsSection = memo(function ChannelsSection({ channels, webhooks, running }: { channels: readonly ChannelDto[]; webhooks: readonly WebhookDto[]; running: boolean }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [messageId, setMessageId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [page, setPage] = useState(0);
@@ -227,10 +284,12 @@ export const ChannelsSection = memo(function ChannelsSection({ channels, webhook
   const current = Math.min(page, pageCount - 1);
   const rows = matches.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE);
   const editing = channels.find((c) => c.id === editingId);
+  const messaging = channels.find((c) => c.id === messageId);
 
   return (
     <Section title="Channels" hint="Every handle can send to its own webhooks, or to several at once.">
       {editing && <ChannelWebhooksDialog key={editing.id} channel={editing} webhooks={webhooks} onClose={() => setEditingId(null)} />}
+      {messaging && <ChannelMessageDialog key={messaging.id} channel={messaging} onClose={() => setMessageId(null)} />}
       <AddChannelForm webhooks={webhooks} />
       {channels.length > 0 && (
         <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -274,6 +333,7 @@ export const ChannelsSection = memo(function ChannelsSection({ channels, webhook
             busy={(toggle.isPending && toggle.variables?.id === c.id) || (remove.isPending && remove.variables === c.id)}
             checkBlocked={running || check.isPending}
             onEdit={setEditingId}
+            onMessage={setMessageId}
             onCheck={check.mutate}
             onToggle={toggle.mutate}
             onRemove={remove.mutate}

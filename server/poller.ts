@@ -3,7 +3,7 @@ import { MAX_INTERVAL_MS, MIN_INTERVAL_MS, VIDEO_ID_RE } from "../shared/contrac
 import type { CheckSource, CheckSummary } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
-import { getIntervalMs, isAutoEnabled, query } from "./db.ts";
+import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
 import { lookupStreams, thumbnailFor } from "./youtube.ts";
@@ -22,6 +22,8 @@ interface Channel {
   name: string | null;
   source: CheckSource | null;
   error: string | null;
+  message: string | null;
+  role_ids: string;
 }
 
 export class CheckRejectedError extends Error {
@@ -58,7 +60,7 @@ export function forget(id: string) {
 }
 
 const enabledHooks = query<Hook>("SELECT id, name, url, error FROM webhooks WHERE enabled = 1");
-const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error FROM channels WHERE enabled = 1 ORDER BY rowid");
+const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, message, role_ids FROM channels WHERE enabled = 1 ORDER BY rowid");
 const allLinks = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const handleOf = query<{ handle: string }>("SELECT handle FROM channels WHERE id = ?");
 
@@ -95,7 +97,10 @@ async function deliver(hook: Hook, channel: Channel, channelName: string, stream
   }
   try {
     const thumbnail = await thumbnailFor(stream.videoId);
-    await postWebhook(hook.url, buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail }));
+    await postWebhook(
+      hook.url,
+      buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: channel.message, roleIds: parseRoleIds(channel.role_ids) }),
+    );
   } catch (err) {
     release.run(hook.id, stream.videoId); // failed send must be retried later
     fail(key);

@@ -3,8 +3,11 @@ import { z } from "zod";
 export const MIN_INTERVAL_MS = 30_000;
 export const MAX_INTERVAL_MS = 86_400_000;
 export const MAX_CHANNELS = 500;
+export const MAX_MESSAGE_LENGTH = 1000;
+export const MAX_ROLES_PER_CHANNEL = 10;
 
 export const HANDLE_RE = /^@[A-Za-z0-9._-]{3,30}$/;
+export const ROLE_ID_RE = /^\d{17,20}$/; // Discord snowflake
 export const VIDEO_ID_RE = /^[\w-]{11}$/;
 export const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 export const WEBHOOK_RE =
@@ -32,6 +35,15 @@ const handle = z
   .transform((s) => (s.startsWith("@") ? s : `@${s}`))
   .pipe(z.string().regex(HANDLE_RE, "Invalid YouTube handle (example: @channelname)"));
 const webhookIds = z.array(uuid).max(25);
+const message = z
+  .string()
+  .max(MAX_MESSAGE_LENGTH, `Message is too long (max ${MAX_MESSAGE_LENGTH})`)
+  .nullable()
+  .transform((s) => s?.trim() || null);
+const roleIds = z
+  .array(z.string().trim().regex(ROLE_ID_RE, "A role id is 17 to 20 digits"))
+  .max(MAX_ROLES_PER_CHANNEL, `At most ${MAX_ROLES_PER_CHANNEL} roles per channel`)
+  .transform((ids) => [...new Set(ids)]);
 const proxyUrl = z
   .string()
   .trim()
@@ -42,7 +54,7 @@ const proxyUrl = z
 
 export const schemas = {
   channelCreate: z.object({ handle, webhookIds: webhookIds.default([]) }),
-  channelPatch: z.object({ enabled: z.boolean().optional(), webhookIds: webhookIds.optional() }),
+  channelPatch: z.object({ enabled: z.boolean().optional(), webhookIds: webhookIds.optional(), message: message.optional(), roleIds: roleIds.optional() }),
   webhookCreate: z.object({ name, url: z.string().trim().regex(WEBHOOK_RE, "Invalid Discord webhook URL") }),
   webhookPatch: z.object({ enabled: z.boolean().optional(), name: name.optional() }),
   settings: z
@@ -83,6 +95,8 @@ export interface ChannelDto {
   source: CheckSource | null;
   error: string | null;
   webhookIds: string[];
+  message: string | null; // custom Discord text; `{user}` = the handle, `@{roleid}` = the roles below
+  roleIds: string[];
 }
 
 export interface WebhookDto {

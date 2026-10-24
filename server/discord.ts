@@ -9,10 +9,27 @@ interface PayloadInput {
   handle: string | null;
   video: { videoId: string; title: string; status: StreamStatus; startAt: number | null };
   thumbnail: string;
+  message?: string | null;
+  roleIds?: readonly string[];
+}
+
+const PLACEHOLDER_RE = /@\{roleid\}|\{user\}/gi;
+const ROLE_TOKEN_RE = /@\{roleid\}/i;
+
+/**
+ * `{user}` becomes the channel handle and `@{roleid}` becomes a mention of every role saved for that handle.
+ * Only the saved roles are allowed to ping (see `allowed_mentions`), so a typed `<@&id>`, `@everyone` or `@here` never pings.
+ */
+function renderMessage(template: string | null | undefined, handle: string | null, roleIds: readonly string[]) {
+  if (!template) return { content: undefined, roles: [] };
+  const mentions = roleIds.map((id) => `<@&${id}>`).join(" ");
+  const text = template.replace(PLACEHOLDER_RE, (token) => (token.toLowerCase() === "{user}" ? (handle ?? "") : mentions));
+  return { content: clip(text.trim(), 2000) || undefined, roles: ROLE_TOKEN_RE.test(template) ? [...roleIds] : [] };
 }
 
 // No `username` on purpose: Discord shows the webhook's own default name and avatar.
-export function buildPayload({ channelName, handle, video, thumbnail }: PayloadInput) {
+export function buildPayload({ channelName, handle, video, thumbnail, message, roleIds = [] }: PayloadInput) {
+  const { content, roles } = renderMessage(message, handle, roleIds);
   const url = `https://www.youtube.com/watch?v=${video.videoId}`;
   const live = video.status === "live";
   const description = live
@@ -21,7 +38,8 @@ export function buildPayload({ channelName, handle, video, thumbnail }: PayloadI
       ? `Starts <t:${video.startAt}:F> (<t:${video.startAt}:R>)`
       : "Start time not announced yet";
   return {
-    allowed_mentions: { parse: [] },
+    ...(content ? { content } : {}),
+    allowed_mentions: { parse: [], roles },
     embeds: [
       {
         title: clip(video.title, 256),

@@ -1,6 +1,6 @@
 import type { CheckSource, CycleDto, Overview, StreamStatus } from "../shared/contract.ts";
 import { YOUTUBE_API_KEY } from "./config.ts";
-import { getIntervalMs, isAutoEnabled, query } from "./db.ts";
+import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
 import { proxyStatus } from "./http.ts";
 import { state } from "./poller.ts";
 
@@ -14,7 +14,9 @@ const channelRows = query<{
   live_count: number;
   source: CheckSource | null;
   error: string | null;
-}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error FROM channels ORDER BY rowid");
+  message: string | null;
+  role_ids: string;
+}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, message, role_ids FROM channels ORDER BY rowid");
 const linkRows = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const webhookRows = query<{ id: string; name: string; url: string; enabled: number; error: string | null }>(
   "SELECT id, name, url, enabled, error FROM webhooks ORDER BY rowid",
@@ -73,6 +75,8 @@ export function overview(): Overview {
       source: c.source,
       error: c.error,
       webhookIds: (links[c.id] ?? []).map((l) => l.webhook_id),
+      message: c.message,
+      roleIds: parseRoleIds(c.role_ids),
     })),
     webhooks: webhookRows.all().map((w) => ({
       id: w.id,
