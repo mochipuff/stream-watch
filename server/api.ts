@@ -1,0 +1,302 @@
+import crypto from "node:crypto";
+import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { HTTPException } from "hono/http-exception";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { z } from "zod";
+import { MAX_CHANNELS, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts";
+import type { StreamStatus } from "../shared/contract.ts";
+import { audit, readAudit } from "./audit.ts";
+import { ADMIN_TOKEN, errorMessage, hostAllowed } from "./config.ts";
+import { query, setSetting, tx } from "./db.ts";
+import { buildPayload, postWebhook } from "./discord.ts";
+import { events } from "./events.ts";
+import { configureProxy, proxyStatus } from "./http.ts";
+import { cycle, overview } from "./overview.ts";
+import { CheckRejectedError, forget, reschedule, startCheck } from "./poller.ts";
+import { issueTicket } from "./realtime.ts";
+import { thumbnailFor } from "./youtube.ts";
+
+const HttpError = (status: ContentfulStatusCode, message: string) => new HTTPException(status, { message });
+
+const digest = (value: string) => crypto.createHash("sha256").update(value).digest();
+const TOKEN_DIGEST = digest(ADMIN_TOKEN);
+let failures = { count: 0, resetAt: 0 };
+
+export const app = new Hono();
+
+app.use("*", async (c, next) => {
+  if (!hostAllowed(c.req.header("host"))) return c.json({ error: "Forbidden host" }, 403);
+  c.header("cache-control", "no-store");
+  c.header("x-content-type-options", "nosniff");
+  await next();
+});
+
+// Unauthenticated on purpose: `npm run dev` polls it to know the API is up. Reveals nothing.
+app.get("/api/health", (c) => c.json({ ok: true }));
+
+app.use("/api/*", async (c, next) => {
+  if (failures.count >= 30 && Date.now() < failures.resetAt) return c.json({ error: "Too many attempts, wait a minute" }, 429);
+  const match = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "");
+  if (!match || !crypto.timingSafeEqual(digest(match[1]!.trim()), TOKEN_DIGEST)) {
+    if (Date.now() >= failures.resetAt) failures = { count: 0, resetAt: Date.now() + 60_000 };
+    failures.count++;
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+});
+app.use("/api/*", bodyLimit({ maxSize: 16 * 1024, onError: (c) => c.json({ error: "Payload too large" }, 413) }));
+
+app.onError((err, c) => {
+  if (err instanceof HTTPException) return c.json({ error: err.message }, err.status);
+  console.error("[api]", err);
+  return c.json({ error: "Internal server error" }, 500);
+});
+app.notFound((c) => c.json({ error: "Not found" }, 404));
+
+async function parseBody<S extends z.ZodType>(c: Context, schema: S): Promise<z.output<S>> {
+  const raw: unknown = await c.req.json().catch(() => {
+    throw HttpError(400, "Body must be valid JSON");
+  });
+  const result = schema.safeParse(raw);
+  if (!result.success) throw HttpError(400, result.error.issues[0]?.message ?? "Invalid request");
+  return result.data;
+}
+
+function paramId(c: Context, name = "id"): string {
+  const parsed = uuid.safeParse(c.req.param(name));
+  if (!parsed.success) throw HttpError(404, "Not found");
+  return parsed.data;
+}
+
+// Every change answers with the fresh snapshot, so the dashboard updates from the response itself and never refetches.
+function changed(c: Context, status: 200 | 201 | 202 = 200) {
+  events.emit("changed"); // other open tabs get the same snapshot over the WebSocket
+  return c.json(overview(), status);
+}
+
+const channelCount = query<{ n: number }>("SELECT COUNT(*) AS n FROM channels");
+const channelRow = query<{ handle: string; enabled: number }>("SELECT handle, enabled FROM channels WHERE id = ?");
+const handleTaken = query("SELECT 1 FROM channels WHERE handle = ? COLLATE NOCASE");
+const insertChannel = query("INSERT INTO channels (id, handle) VALUES (?, ?)");
+const setChannelEnabled = query("UPDATE channels SET enabled = ? WHERE id = ?");
+const deleteChannel = query("DELETE FROM channels WHERE id = ?"); // links go with it (ON DELETE CASCADE)
+const clearLinks = query("DELETE FROM channel_webhooks WHERE channel_id = ?");
+const insertLink = query("INSERT OR IGNORE INTO channel_webhooks (channel_id, webhook_id) VALUES (?, ?)");
+
+const webhookRow = query<{ name: string; url: string; enabled: number }>("SELECT name, url, enabled FROM webhooks WHERE id = ?");
+const urlTaken = query("SELECT 1 FROM webhooks WHERE url = ?");
+const insertWebhook = query("INSERT INTO webhooks (id, name, url) VALUES (?, ?, ?)");
+const setWebhookEnabled = query("UPDATE webhooks SET enabled = ? WHERE id = ?");
+const setWebhookName = query("UPDATE webhooks SET name = ? WHERE id = ?");
+const deleteWebhook = query("DELETE FROM webhooks WHERE id = ?");
+
+const resendRow = query<{
+  title: string;
+  start_at: number | null;
+  channel_name: string | null;
+  status: StreamStatus;
+  url: string;
+  webhook_name: string;
+  handle: string | null;
+}>(
+  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle
+   FROM sent_streams s
+   JOIN webhooks w ON w.id = s.webhook_id
+   LEFT JOIN channels c ON c.id = s.channel_id
+   WHERE s.webhook_id = ? AND s.video_id = ? AND s.delivered = 1`,
+);
+const touchSent = query("UPDATE sent_streams SET sent_at = ? WHERE webhook_id = ? AND video_id = ?");
+
+function setLinks(channelId: string, webhookIds: string[]) {
+  clearLinks.run(channelId);
+  try {
+    for (const id of webhookIds) insertLink.run(channelId, id);
+  } catch {
+    throw HttpError(400, "Unknown webhook selected"); // foreign key failed; the surrounding tx rolls back
+  }
+}
+
+app.post("/api/ws-ticket", (c) => {
+  const ticket = issueTicket();
+  if (!ticket) throw HttpError(429, "Too many pending tickets");
+  return c.json({ ticket });
+});
+
+app.get("/api/overview", (c) => c.json(overview()));
+app.get("/api/cycle", (c) => c.json(cycle()));
+
+app.get("/api/audit", (c) => {
+  const parsed = schemas.auditQuery.safeParse(c.req.query());
+  if (!parsed.success) throw HttpError(400, parsed.error.issues[0]?.message ?? "Invalid request");
+  return c.json(readAudit(parsed.data));
+});
+
+// Starts a check and answers at once; a large channel list must not hold the request open. The result arrives
+// as a WebSocket event and in the audit log, and GET /api/cycle shows `running` meanwhile.
+function runCheck(c: Context, channelId?: string) {
+  try {
+    startCheck(channelId);
+  } catch (err) {
+    if (err instanceof CheckRejectedError) throw HttpError(err.status, err.message);
+    throw err;
+  }
+  return c.json(overview(), 202);
+}
+
+app.post("/api/check", (c) => runCheck(c));
+
+app.post("/api/channels", async (c) => {
+  const body = await parseBody(c, schemas.channelCreate);
+  const id = crypto.randomUUID();
+  tx(() => {
+    if ((channelCount.get()?.n ?? 0) >= MAX_CHANNELS) throw HttpError(409, `Channel limit reached (${MAX_CHANNELS})`);
+    if (handleTaken.get(body.handle)) throw HttpError(409, "Channel already exists");
+    insertChannel.run(id, body.handle);
+    setLinks(id, body.webhookIds);
+  });
+  audit("info", "channel.added", `Added ${body.handle}`);
+  return changed(c, 201);
+});
+
+app.patch("/api/channels/:id", async (c) => {
+  const id = paramId(c);
+  const body = await parseBody(c, schemas.channelPatch);
+  const row = tx(() => {
+    const current = channelRow.get(id);
+    if (!current) throw HttpError(404, "Channel not found");
+    if (body.enabled !== undefined) setChannelEnabled.run(body.enabled ? 1 : 0, id);
+    if (body.webhookIds) setLinks(id, body.webhookIds);
+    return current;
+  });
+  if (body.enabled !== undefined && body.enabled !== Boolean(row.enabled)) {
+    audit("info", body.enabled ? "channel.resumed" : "channel.paused", `${body.enabled ? "Resumed" : "Paused"} ${row.handle}`);
+  }
+  if (body.webhookIds) audit("info", "channel.webhooks", `${row.handle} now sends to ${body.webhookIds.length} webhook(s)`);
+  return changed(c);
+});
+
+app.post("/api/channels/:id/check", (c) => {
+  const id = paramId(c);
+  const row = channelRow.get(id);
+  if (!row) throw HttpError(404, "Channel not found");
+  if (!row.enabled) throw HttpError(409, "Channel is paused");
+  return runCheck(c, id);
+});
+
+app.delete("/api/channels/:id", (c) => {
+  const id = paramId(c);
+  const row = channelRow.get(id);
+  if (!row || Number(deleteChannel.run(id).changes) === 0) throw HttpError(404, "Channel not found");
+  forget(id);
+  audit("info", "channel.removed", `Removed ${row.handle}`);
+  return changed(c);
+});
+
+app.post("/api/webhooks", async (c) => {
+  const body = await parseBody(c, schemas.webhookCreate);
+  if (urlTaken.get(body.url)) throw HttpError(409, "Webhook already added");
+  insertWebhook.run(crypto.randomUUID(), body.name, body.url);
+  audit("info", "webhook.added", `Added webhook ${body.name}`);
+  return changed(c, 201);
+});
+
+app.patch("/api/webhooks/:id", async (c) => {
+  const id = paramId(c);
+  const body = await parseBody(c, schemas.webhookPatch);
+  const row = tx(() => {
+    const current = webhookRow.get(id);
+    if (!current) throw HttpError(404, "Webhook not found");
+    if (body.enabled !== undefined) setWebhookEnabled.run(body.enabled ? 1 : 0, id);
+    if (body.name) setWebhookName.run(body.name, id);
+    return current;
+  });
+  if (body.enabled !== undefined && body.enabled !== Boolean(row.enabled)) {
+    audit("info", body.enabled ? "webhook.resumed" : "webhook.paused", `${body.enabled ? "Resumed" : "Paused"} webhook ${row.name}`);
+  }
+  if (body.name && body.name !== row.name) audit("info", "webhook.renamed", `Renamed webhook ${row.name} to ${body.name}`);
+  return changed(c);
+});
+
+app.delete("/api/webhooks/:id", (c) => {
+  const id = paramId(c);
+  const row = webhookRow.get(id);
+  if (!row || Number(deleteWebhook.run(id).changes) === 0) throw HttpError(404, "Webhook not found");
+  forget(id);
+  audit("info", "webhook.removed", `Removed webhook ${row.name}`);
+  return changed(c);
+});
+
+app.post("/api/webhooks/:id/test", async (c) => {
+  const hook = webhookRow.get(paramId(c));
+  if (!hook) throw HttpError(404, "Webhook not found");
+  const video = { videoId: "dQw4w9WgXcQ", title: "Test Stream Notification", status: "upcoming" as const, startAt: Math.floor(Date.now() / 1000) + 3600 };
+  const thumbnail = `https://i.ytimg.com/vi/${video.videoId}/maxresdefault.jpg`;
+  try {
+    await postWebhook(hook.url, buildPayload({ channelName: "Stream Watch test", handle: "@YouTube", video, thumbnail }));
+  } catch (err) {
+    audit("warn", "webhook.test", `Test message to ${hook.name} failed: ${errorMessage(err)}`);
+    throw HttpError(502, errorMessage(err));
+  }
+  audit("info", "webhook.test", `Test message sent to ${hook.name}`);
+  return c.json(overview());
+});
+
+// Manual and deliberately not idempotent, so a short per-target cooldown stops double clicks from spamming Discord.
+const RESEND_COOLDOWN_MS = 10_000;
+const lastResend = new Map<string, number>();
+
+app.post("/api/sent/:webhookId/:videoId/resend", async (c) => {
+  const webhookId = paramId(c, "webhookId");
+  const videoId = c.req.param("videoId");
+  if (!VIDEO_ID_RE.test(videoId)) throw HttpError(404, "Not found");
+  const row = resendRow.get(webhookId, videoId);
+  if (!row) throw HttpError(404, "This stream or its webhook no longer exists");
+
+  const now = Date.now();
+  for (const [k, at] of lastResend) if (at + RESEND_COOLDOWN_MS < now) lastResend.delete(k);
+  const key = `${webhookId}:${videoId}`;
+  if (lastResend.has(key)) throw HttpError(429, "Already sent a moment ago, wait a few seconds");
+  lastResend.set(key, now);
+
+  try {
+    await postWebhook(
+      row.url,
+      buildPayload({
+        channelName: row.channel_name || row.handle || "YouTube channel",
+        handle: row.handle,
+        video: { videoId, title: row.title, status: row.status, startAt: row.start_at },
+        thumbnail: await thumbnailFor(videoId),
+      }),
+    );
+  } catch (err) {
+    lastResend.delete(key);
+    audit("warn", "stream.resent", `Sending "${row.title}" again to ${row.webhook_name} failed: ${errorMessage(err)}`);
+    throw HttpError(502, errorMessage(err));
+  }
+  touchSent.run(Math.floor(now / 1000), webhookId, videoId);
+  audit("info", "stream.resent", `"${row.title}" sent again to ${row.webhook_name}`);
+  return changed(c);
+});
+
+app.put("/api/settings", async (c) => {
+  const body = await parseBody(c, schemas.settings);
+  if (body.proxyUrl !== undefined) {
+    try {
+      configureProxy(body.proxyUrl); // first: an unusable proxy must reject the whole request before anything else is saved
+    } catch {
+      throw HttpError(400, "Proxy URL cannot be used");
+    }
+    audit("info", "settings.proxy", body.proxyUrl ? `Proxy set to ${proxyStatus()?.url}` : "Proxy removed, using a direct connection");
+  }
+  if (body.intervalMs !== undefined) {
+    setSetting("intervalMs", String(body.intervalMs));
+    audit("info", "settings.interval", `Check interval set to ${body.intervalMs / 1000}s`);
+  }
+  if (body.auto !== undefined) {
+    setSetting("auto", body.auto ? "1" : "0");
+    audit("info", "settings.auto", `Automatic checks turned ${body.auto ? "on" : "off"}`);
+  }
+  reschedule();
+  return changed(c);
+});
