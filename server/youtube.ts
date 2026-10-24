@@ -180,7 +180,7 @@ function extractStreamsFromInitialData(data: unknown): Stream[] {
     const obj = node as Record<string, unknown>;
 
     // Handle traditional videoRenderer / gridVideoRenderer
-    const v = (obj.videoRenderer ?? obj.gridVideoRenderer) as Record<string, any> | undefined;
+    const v = (obj.videoRenderer ?? obj.gridVideoRenderer ?? obj.richItemRenderer?.content?.videoRenderer) as Record<string, any> | undefined;
     if (v && typeof v.videoId === "string" && VIDEO_ID_RE.test(v.videoId)) {
       const vid = v.videoId;
       if (!seen.has(vid)) {
@@ -196,11 +196,12 @@ function extractStreamsFromInitialData(data: unknown): Stream[] {
         const isUpcoming =
           Boolean(upcomingData?.startTime) ||
           badgesStr.includes("UPCOMING") ||
-          overlaysStr.includes("UPCOMING");
+          overlaysStr.includes("UPCOMING") ||
+          JSON.stringify(v).includes("upcomingEventData");
 
         const isLive =
           !isUpcoming &&
-          (badgesStr.includes("LIVE") || overlaysStr.includes("LIVE"));
+          (badgesStr.includes("LIVE") || overlaysStr.includes("LIVE") || JSON.stringify(v).includes('"isLive":true'));
 
         if (isUpcoming) {
           seen.add(vid);
@@ -285,18 +286,33 @@ function extractStreamsFromHtml(html: string): Stream[] {
 }
 
 async function fetchStreamsFromTab(handleOrChannelId: string): Promise<Stream[]> {
-  const url =
-    handleOrChannelId.startsWith("UC") && handleOrChannelId.length === 24
-      ? `https://www.youtube.com/channel/${handleOrChannelId}/streams`
-      : `https://www.youtube.com/${handleOrChannelId.startsWith("@") ? handleOrChannelId : "@" + handleOrChannelId}/streams`;
+  const isChannelId = handleOrChannelId.startsWith("UC") && handleOrChannelId.length === 24;
+  const base = isChannelId
+    ? `https://www.youtube.com/channel/${handleOrChannelId}`
+    : `https://www.youtube.com/${handleOrChannelId.startsWith("@") ? handleOrChannelId : "@" + handleOrChannelId}`;
+  const urls = [
+    `${base}/streams`,
+    `${base}/videos?view=0&sort=dd&live_view=501`,
+    `${base}/videos?view=0&sort=dd&live_view=502`,
+    isChannelId ? `https://www.youtube.com/${handleOrChannelId}/streams` : `${base}/live`,
+  ];
 
-  const html = await getHtml(url, (h) => extractInitialData(h) !== null, 3_000_000);
-  const data = extractInitialData(html);
-  if (data) {
-    const streams = extractStreamsFromInitialData(data);
-    if (streams.length > 0) return streams;
+  let lastError: unknown;
+  for (const url of urls) {
+    try {
+      const html = await getHtml(url, (h) => extractInitialData(h) !== null, 3_000_000);
+      const data = extractInitialData(html);
+      if (data) {
+        const streams = extractStreamsFromInitialData(data);
+        if (streams.length > 0) return streams;
+      }
+      const fallback = extractStreamsFromHtml(html);
+      if (fallback.length > 0) return fallback;
+    } catch (err) {
+      lastError = err;
+    }
   }
-  return extractStreamsFromHtml(html);
+  throw lastError ?? new Error("No streams found on YouTube tabs");
 }
 
 // ---------- Source 1: RSS Feed & Watch Page Classification ----------
@@ -504,7 +520,8 @@ async function readFeed(channelId: string): Promise<{ channelName: string | null
 async function viaRss(channel: ChannelRef): Promise<Lookup> {
   const channelId = channel.youtubeId ?? (await resolveChannelId(channel.handle));
 
-  // 1. Fetch upcoming & live streams from the /streams tab
+  // 1. Fetch upcoming & live streams from YouTube tabs. These pages are the only source that can show
+  //    far-future scheduled broadcasts that are not in the recent uploads feed yet.
   let tabStreams: Stream[] = [];
   try {
     tabStreams = await fetchStreamsFromTab(channel.handle || channelId);
@@ -622,11 +639,12 @@ async function recentUploads(channelId: string): Promise<string[]> {
 async function apiUpcomingAndLive(channelId: string): Promise<string[]> {
   const ids = new Set<string>();
 
-  // 1. Search for upcoming scheduled live streams
+  // 1. Search for upcoming scheduled live streams. Keep a wider search window than the RSS feed so a stream
+  //    scheduled a year out still gets picked up when it is first public.
   try {
     const upcoming = await apiGet(
       "search",
-      { part: "id", channelId, eventType: "upcoming", type: "video", maxResults: "10" },
+      { part: "id", channelId, eventType: "upcoming", type: "video", maxResults: "25" },
       searchSchema,
     );
     for (const item of upcoming.items) {
@@ -640,7 +658,7 @@ async function apiUpcomingAndLive(channelId: string): Promise<string[]> {
   try {
     const live = await apiGet(
       "search",
-      { part: "id", channelId, eventType: "live", type: "video", maxResults: "5" },
+      { part: "id", channelId, eventType: "live", type: "video", maxResults: "10" },
       searchSchema,
     );
     for (const item of live.items) {
@@ -731,3 +749,378 @@ export async function thumbnailFor(videoId: string): Promise<string> {
   }
   return max;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
