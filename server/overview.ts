@@ -1,8 +1,8 @@
 import type { CheckSource, CycleDto, Overview, StreamStatus } from "../shared/contract.ts";
-import { YOUTUBE_API_KEY } from "./config.ts";
 import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
 import { proxyStatus } from "./http.ts";
 import { state } from "./poller.ts";
+import { sourceStates } from "./sources.ts";
 
 const channelRows = query<{
   id: string;
@@ -18,6 +18,9 @@ const channelRows = query<{
   role_ids: string;
 }>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, message, role_ids FROM channels ORDER BY rowid");
 const linkRows = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
+const manualRows = query<{ channel_id: string; video_id: string; added_at: number }>(
+  "SELECT channel_id, video_id, added_at FROM manual_videos ORDER BY added_at",
+);
 const webhookRows = query<{ id: string; name: string; url: string; enabled: number; error: string | null }>(
   "SELECT id, name, url, enabled, error FROM webhooks ORDER BY rowid",
 );
@@ -60,10 +63,11 @@ export function cycle(): CycleDto {
 /** Everything the dashboard shows, built only from fields it needs (never raw rows). */
 export function overview(): Overview {
   const links = Object.groupBy(linkRows.all(), (l) => l.channel_id);
+  const manual = Object.groupBy(manualRows.all(), (v) => v.channel_id);
   return {
     rev: ++rev,
     cycle: cycle(),
-    sources: { apiConfigured: YOUTUBE_API_KEY !== "", proxy: proxyStatus() },
+    sources: { sources: sourceStates(), proxy: proxyStatus() },
     channels: channelRows.all().map((c) => ({
       id: c.id,
       handle: c.handle,
@@ -77,6 +81,7 @@ export function overview(): Overview {
       webhookIds: (links[c.id] ?? []).map((l) => l.webhook_id),
       message: c.message,
       roleIds: parseRoleIds(c.role_ids),
+      manualVideos: (manual[c.id] ?? []).map((v) => ({ videoId: v.video_id, addedAt: v.added_at })),
     })),
     webhooks: webhookRows.all().map((w) => ({
       id: w.id,

@@ -1,54 +1,11 @@
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import type { CycleDto } from "../shared/contract.ts";
 import { ActivitySection } from "./activity.tsx";
-import { OVERVIEW_KEY, ApiError, api, auth, lock, queryClient, useAction, useOverview, useToken } from "./api.ts";
+import { api, useAction, useOverview } from "./api.ts";
 import { ChannelsSection } from "./channels.tsx";
 import { useRealtime } from "./realtime.ts";
 import { CycleSection, RecentSection, SourcesSection, WebhooksSection } from "./sections.tsx";
-import { ChipGroup, RelativeTime, ToastContainer, buttonCls, inputCls, quietCls, useNow } from "./ui.tsx";
-
-function Gate() {
-  const [value, setValue] = useState("");
-  const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
-
-  async function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const candidate = value.trim();
-    setPending(true);
-    setError("");
-    try {
-      // Checked with the typed token before it is stored, so a wrong one never flashes the dashboard.
-      queryClient.setQueryData(OVERVIEW_KEY, await api.overview(candidate));
-      auth.set(candidate);
-    } catch (err) {
-      setError(err instanceof ApiError && err.status === 401 ? "That token is not correct." : err instanceof Error ? err.message : "Request failed");
-      setPending(false);
-    }
-  }
-
-  return (
-    <main className="mx-auto flex min-h-screen max-w-sm flex-col justify-center gap-4 p-6">
-      <h1 className="text-2xl font-semibold">Stream Watch</h1>
-      <p className="text-sm text-muted">Enter the admin token from your server settings to open the dashboard.</p>
-      <form onSubmit={submit} className="flex flex-col gap-3">
-        <input
-          type="password"
-          autoComplete="current-password"
-          aria-label="Admin token"
-          className={inputCls}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          required
-        />
-        {error && <p className="text-sm text-signal">{error}</p>}
-        <button className={buttonCls} disabled={pending}>
-          Open dashboard
-        </button>
-      </form>
-    </main>
-  );
-}
+import { ChipGroup, RelativeTime, ToastContainer, buttonCls, quietCls, useNow } from "./ui.tsx";
 
 function StatusLine({ cycle, hasHooks, connected }: { cycle: CycleDto; hasHooks: boolean; connected: boolean }) {
   const now = useNow();
@@ -99,9 +56,6 @@ function Dashboard() {
             <button className={quietCls} onClick={() => void refetch()}>
               Retry
             </button>
-            <button className={quietCls} onClick={lock}>
-              Lock
-            </button>
           </>
         )}
       </div>
@@ -123,9 +77,6 @@ function Dashboard() {
           <button className={buttonCls} disabled={cycle.running || check.isPending} onClick={() => check.mutate()}>
             {cycle.running ? "Checking…" : "Check now"}
           </button>
-          <button className={quietCls} onClick={lock}>
-            Lock
-          </button>
         </div>
       </header>
       <ChipGroup label="View" options={VIEWS} value={view} onChange={setView} />
@@ -145,10 +96,9 @@ function Dashboard() {
 }
 
 export default function App() {
-  const token = useToken();
   return (
     <>
-      {token ? <Dashboard /> : <Gate />}
+      <Dashboard />
       <ToastContainer />
     </>
   );

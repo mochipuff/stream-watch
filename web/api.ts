@@ -1,32 +1,6 @@
 import { MutationCache, QueryClient, useMutation, useQuery } from "@tanstack/react-query";
-import { useSyncExternalStore } from "react";
-import type { AuditLevel, AuditPage, ChannelCreateInput, ChannelPatchInput, Overview, SettingsInput, WebhookCreateInput } from "../shared/contract.ts";
+import type { AuditLevel, AuditPage, ChannelCreateInput, ChannelPatchInput, ManualVideoCreateInput, Overview, SettingsInput, WebhookCreateInput } from "../shared/contract.ts";
 import { toast } from "./toast.ts";
-
-// The token lives in sessionStorage, so closing the tab locks the dashboard.
-const TOKEN_KEY = "stream-watch-token";
-const listeners = new Set<() => void>();
-
-export const auth = {
-  get: () => sessionStorage.getItem(TOKEN_KEY),
-  set(token: string | null) {
-    if (token) sessionStorage.setItem(TOKEN_KEY, token);
-    else sessionStorage.removeItem(TOKEN_KEY);
-    listeners.forEach((listener) => listener());
-  },
-  subscribe(listener: () => void) {
-    listeners.add(listener);
-    return () => {
-      listeners.delete(listener);
-    };
-  },
-};
-export const useToken = () => useSyncExternalStore(auth.subscribe, auth.get);
-
-export function lock() {
-  auth.set(null);
-  queryClient.clear(); // nothing from this session stays in memory
-}
 
 export class ApiError extends Error {
   status: number;
@@ -36,15 +10,14 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown, token = auth.get() ?? ""): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api/${path}`, {
     method,
-    headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    headers: body === undefined ? {} : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data: unknown = await res.json().catch(() => null);
   if (!res.ok) {
-    if (res.status === 401) lock();
     throw new ApiError(res.status, (data as { error?: string } | null)?.error ?? `Request failed (${res.status})`);
   }
   return data as T;
@@ -52,10 +25,11 @@ async function request<T>(method: string, path: string, body?: unknown, token = 
 
 // Every change answers with the new Overview, so the cache is updated straight from the response.
 export const api = {
-  overview: (token?: string) => request<Overview>("GET", "overview", undefined, token),
-  ticket: () => request<{ ticket: string }>("POST", "ws-ticket"),
+  overview: () => request<Overview>("GET", "overview"),
   addChannel: (body: ChannelCreateInput) => request<Overview>("POST", "channels", body),
   patchChannel: (id: string, body: ChannelPatchInput) => request<Overview>("PATCH", `channels/${id}`, body),
+  addVideo: (channelId: string, body: ManualVideoCreateInput) => request<Overview>("POST", `channels/${channelId}/videos`, body),
+  removeVideo: (channelId: string, videoId: string) => request<Overview>("DELETE", `channels/${channelId}/videos/${videoId}`),
   removeChannel: (id: string) => request<Overview>("DELETE", `channels/${id}`),
   addWebhook: (body: WebhookCreateInput) => request<Overview>("POST", "webhooks", body),
   patchWebhook: (id: string, body: { enabled: boolean }) => request<Overview>("PATCH", `webhooks/${id}`, body),
@@ -80,13 +54,11 @@ export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 15_000, // the WebSocket keeps the data fresh; a refetch only happens after it was down
-      retry: (count, err) => count < 2 && !(err instanceof ApiError && err.status === 401),
+      retry: 2,
     },
   },
   mutationCache: new MutationCache({
-    onError: (err) => {
-      if (!(err instanceof ApiError && err.status === 401)) toast.error(err.message); // 401 already locked the dashboard
-    },
+    onError: (err) => toast.error(err.message),
   }),
 });
 

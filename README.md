@@ -13,16 +13,25 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. On first run a random `ADMIN_TOKEN` is written to `.env` and printed; use it to log in. The API starts first on http://127.0.0.1:8787 and Vite starts once it answers. The database is created at `data/app.db` on API start.
+Open http://localhost:5173. There is no login: the API only listens on 127.0.0.1 and only answers this machine's own dashboard (see Security). The API starts first on http://127.0.0.1:8787 and Vite starts once it answers. The database is created at `data/app.db` on API start.
 
-Separate terminals also work once `.env` holds an `ADMIN_TOKEN` (run `npm run dev` once to create it): `npm run dev:server` and `npm run dev:web`. `npm run typecheck` checks server, shared code and dashboard together.
+Separate terminals also work: `npm run dev:server` and `npm run dev:web`. `npm run typecheck` checks server, shared code and dashboard together.
 
 The poller lives in the API process, not in the browser: closing the dashboard tab never stops it. Closing the terminal that runs `npm run dev` does.
 
 ## How channels are checked
 
-1. **RSS feed** (default, no key): the channel's `feeds/videos.xml` lists recent videos. YouTube sometimes answers this endpoint with a short-lived 404 or 5xx, so one retry follows, then the channel's live-streams playlist feed (`playlist_id=UULV…`) is tried before the check counts as failed. The channel's `/streams` tab only nominates candidates (it is matched on badges and view counts, never on titles, and the channel's `/live` page is not used because it shows the latest stream even when it ended long ago). Every candidate and every feed video is then confirmed from its own watch page and classified as `live`, `upcoming` or plain; a stream with an end time is always plain, so an old VOD is never announced as live. Plain videos are remembered in the database and never loaded again; live and upcoming ones are re-read every 5 minutes.
-2. **YouTube Data API v3** (fallback, needs `YOUTUBE_API_KEY` in `.env`): used only when the RSS path fails. It reads the uploads playlist and classifies the videos with `liveBroadcastContent`. The key is sent in a header, never in a URL. When the quota is used up, the API is paused for 1 hour.
+A check has two steps: **discovery** (which videos of the channel might be live or upcoming) and **classification** (what each one is). Three discovery sources work independently, cheapest first, and each can be switched on or off under "Sources and proxy":
+
+1. **RSS feed**: the channel's `feeds/videos.xml` lists recent uploads (a few KB). One attempt per check; if it answers 404 or 5xx, the channel's live-streams playlist feed (`playlist_id=UULV…`) is tried once. No sleeping and retrying: the next cycle is the retry.
+2. **Page scraping** (no key): the channel's `/streams` tab, then the older live filters and the handle URL, and finally the `/live` page. A page only counts when it really is a channel listing, so an unreadable page is an error and never "nothing is live". Candidates are read from the open tab only and matched on badges, never on titles. These pages are 1 to 3 MB, so with RSS healthy they are re-read every 2 minutes (every minute while RSS is down); "Check now" always re-reads them. If only the `/live` page can be read, the check still works for "live now" and the log warns that YouTube may have changed its layout.
+3. **YouTube Data API v3** (optional `YOUTUBE_API_KEY`): used only when RSS and page scraping both fail. It reads the live-streams and uploads playlists and classifies with `liveBroadcastContent`, about 3 units per check (the quota is 10,000 a day). The key is sent in a header, never in a URL. When the quota is used up the API is paused for 1 hour.
+
+**One failing source never fails the check while another answers.** Each source has a breaker: after 3 failures in a row (or at once on HTTP 429, a consent page or a bot check) it rests for 30s, 60s, 2m … up to 10m, and the dashboard shows the countdown. A manual check goes around the rest period. Being offline (DNS or connection errors) never pauses a source.
+
+**Classification** reads each candidate's own watch page and decides `live`, `upcoming` or plain; a stream with an end time is always plain, so an old VOD is never announced as live. A bot-check or sign-in page is an error and is never remembered as a plain video. Plain videos are remembered in the database and never loaded again; live and upcoming ones are re-read every 5 minutes. If watch pages cannot be read, the API classifies them.
+
+**Videos added by hand**: the "Videos" button on a channel takes a watch, live, shorts or youtu.be link (up to 10 per channel). Those videos are checked with the channel whatever the three sources do, so they still work while everything else fails. A video of another channel is refused, and one that is no longer live or upcoming (or older than 14 days) is removed. With all three sources off, only these videos are checked.
 
 The dashboard shows which source answered for each channel. The channel id (UC…) is resolved once and stored.
 
@@ -39,11 +48,19 @@ The dashboard shows which source answered for each channel. The channel id (UC�
 ## How it fits together
 
 - `shared/contract.ts`: Zod schemas, limits and the API/WebSocket types. The server validates with it and the dashboard imports the same types.
-- `server/`: Hono API (`api.ts`), YouTube sources (`youtube.ts`), proxy-aware fetch (`http.ts`), Discord sender (`discord.ts`), poller (`poller.ts`), audit log (`audit.ts`), events (`events.ts`), WebSocket pushes (`realtime.ts`), SQLite (`db.ts`).
+- `server/`: Hono API (`api.ts`), check logic (`youtube.ts`), page scraping (`yt-pages.ts`), API fallback (`yt-api.ts`), source breakers (`sources.ts`), proxy-aware fetch (`http.ts`), Discord sender (`discord.ts`), poller (`poller.ts`), audit log (`audit.ts`), events (`events.ts`), WebSocket pushes (`realtime.ts`), SQLite (`db.ts`).
 - `web/`: React 19 dashboard. TanStack Query holds the data; the WebSocket and every API response write the same snapshot into it, so the page never refetches after an action. The activity log is paged from the server.
-- `/api/*` JSON API: `overview`, `cycle`, `check`, `channels`, `channels/:id/check`, `webhooks`, `webhooks/:id/test`, `sent/:webhookId/:videoId/resend`, `settings` (`intervalMs`, `auto`, `proxyUrl`), `audit?level=&before=&limit=`, `ws-ticket`. Everything except `GET /api/health` needs `Authorization: Bearer <ADMIN_TOKEN>`.
+- `/api/*` JSON API: `overview`, `cycle`, `check`, `channels`, `channels/:id/check`, `channels/:id/videos`, `webhooks`, `webhooks/:id/test`, `sent/:webhookId/:videoId/resend`, `settings` (`intervalMs`, `auto`, `proxyUrl`, `sources`), `audit?level=&before=&limit=`.
   - `POST /api/check` and `POST /api/channels/:id/check` start a check and answer `202` at once with the snapshot (`cycle.running` is `true`). The result arrives as a `check_done` WebSocket event and in the audit log. They answer `409` while a check is running and `429` when called again within 5 seconds.
   - `GET /api/cycle` returns `{ auto, running, intervalMs, lastCycleAt, nextCycleAt }`.
-- `/api/ws` realtime WebSocket on the same port. The dashboard gets a single-use ticket from `POST /api/ws-ticket`, so the token never appears in a URL.
+- `/api/ws` realtime WebSocket on the same port.
 
-Data is stored in SQLite (`DB_PATH`, default `./data/app.db`; it holds webhook URLs and the proxy URL, so keep it private). The check interval is 30s to 24h. The API only listens on 127.0.0.1 by default; keep it that way unless you add HTTPS in front. Older databases are upgraded automatically on start.
+## Security
+
+There is no admin key: this is a single-user tool on your own machine. Instead of a secret, the server refuses everything that does not come from its own dashboard: the `Host` must be a loopback name (stops DNS rebinding), `Origin` must match it, `Sec-Fetch-Site` must not be cross-site, and a body must be JSON. A website open in your browser cannot send anything to `http://127.0.0.1:8787`. `HOST` must be `127.0.0.1`, `localhost` or `::1`; the server refuses to start on any other address, because without a login that would hand control to the network. Any program running as you on this machine can still call the API, as it could read `data/app.db`.
+
+## Database
+
+Data is stored in SQLite (`DB_PATH`, default `./data/app.db`; it holds webhook URLs and the proxy URL, so keep it private). The check interval is 30s to 24h. The API only listens on 127.0.0.1.
+
+The schema adapts itself: `PRAGMA user_version` records how far the file has been brought forward, and every step on start is idempotent. A database from any earlier release (including one from before versioning existed) is upgraded in place without losing data. Before an existing database is changed, a consistent copy is written next to it as `app.db-backup-v<from>-<timestamp>` (the newest 3 are kept). A database written by a newer version of the app is refused rather than damaged. To add a column or table, append a step to `MIGRATIONS` in `server/db.ts`; never edit a released step.

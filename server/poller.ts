@@ -6,6 +6,7 @@ import { errorMessage } from "./config.ts";
 import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
+import { SOURCE_LABEL } from "./sources.ts";
 import { lookupStreams, thumbnailFor } from "./youtube.ts";
 import type { Stream } from "./youtube.ts";
 
@@ -41,6 +42,7 @@ export const state: { running: boolean; lastCycleAt: number | null; nextCycleAt:
 };
 
 const MAX_PARALLEL_CHANNELS = 3;
+const MANUAL_TTL_SEC = 14 * 86_400; // a video added by hand that never goes live stops being checked after two weeks
 const MANUAL_GAP_MS = 5000;
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -63,6 +65,9 @@ const enabledHooks = query<Hook>("SELECT id, name, url, error FROM webhooks WHER
 const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, message, role_ids FROM channels WHERE enabled = 1 ORDER BY rowid");
 const allLinks = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const handleOf = query<{ handle: string }>("SELECT handle FROM channels WHERE id = ?");
+const manualOf = query<{ video_id: string }>("SELECT video_id FROM manual_videos WHERE channel_id = ? ORDER BY added_at");
+const removeManual = query("DELETE FROM manual_videos WHERE channel_id = ? AND video_id = ?");
+const expireManual = query("DELETE FROM manual_videos WHERE added_at < ?");
 
 // Claim first, send second: the PRIMARY KEY makes "already sent" atomic even if two sends race.
 // A claim stays `delivered = 0` until Discord accepts the message; see `discardUnconfirmed`.
@@ -81,7 +86,7 @@ const refresh = query(
 );
 const setHookError = query("UPDATE webhooks SET error = ? WHERE id = ?");
 const markChecked = query(
-  `UPDATE channels SET checked_at = ?, youtube_id = ?, name = ?, source = ?, upcoming_count = ?, live_count = ?, error = NULL WHERE id = ?`,
+  `UPDATE channels SET checked_at = ?, youtube_id = ?, name = ?, source = ?, upcoming_count = ?, live_count = ?, error = ? WHERE id = ?`,
 );
 const markFailed = query("UPDATE channels SET checked_at = ?, error = ? WHERE id = ?");
 
@@ -132,13 +137,18 @@ async function deliver(hook: Hook, channel: Channel, channelName: string, stream
   return true;
 }
 
+// A change of source is only worth a line when it means a worse (API) or manual-only answer, or the return from one:
+// RSS and page scraping trade places all the time while YouTube is flaky, and that is what the source breakers are for.
+const isFallback = (source: CheckSource | null) => source === "api" || source === "manual";
+const labelOf = (source: CheckSource) => (source === "manual" ? "the manual videos only" : SOURCE_LABEL[source]);
+
 async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Promise<{ sent: number; failed: boolean }> {
   const key = `ch:${channel.id}`;
   if (!force && blocked(key)) return { sent: 0, failed: false };
   try {
-    const found = await lookupStreams({ handle: channel.handle, youtubeId: channel.youtube_id, name: channel.name });
+    const manualIds = manualOf.all(channel.id).map((row) => row.video_id);
+    const found = await lookupStreams({ handle: channel.handle, youtubeId: channel.youtube_id, name: channel.name }, { force, manualIds });
     const streams = found.streams.filter((s) => VIDEO_ID_RE.test(s.videoId));
-    ok(key);
     markChecked.run(
       nowSec(),
       found.channelId,
@@ -146,17 +156,41 @@ async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Pr
       found.source,
       streams.filter((s) => s.status === "upcoming").length,
       streams.filter((s) => s.status === "live").length,
+      found.error,
       channel.id,
     );
-    if (channel.error) audit("info", "channel.recovered", `${channel.handle} is working again`);
-    if (channel.source && channel.source !== found.source) {
-      audit(found.source === "api" ? "warn" : "info", "channel.source", `${channel.handle} is now checked through ${found.source === "api" ? "the YouTube API (RSS failed)" : "RSS"}`);
+    for (const id of found.manual.ended) {
+      removeManual.run(channel.id, id);
+      audit("info", "video.finished", `Manual video ${id} of ${channel.handle} is not live or upcoming (any more) and was removed`);
     }
+    for (const id of found.manual.foreign) {
+      removeManual.run(channel.id, id);
+      audit("warn", "video.foreign", `Manual video ${id} belongs to another channel than ${channel.handle} and was removed`);
+    }
+
+    if (found.error) {
+      fail(key);
+      if (channel.error !== found.error) {
+        events.emit("channel_error", { channelId: channel.id, handle: channel.handle, error: found.error });
+        audit("error", "channel.error", `${channel.handle}: ${found.error}`);
+      }
+    } else {
+      ok(key);
+      if (channel.error) audit("info", "channel.recovered", `${channel.handle} is working again`);
+    }
+    if (channel.source !== found.source && (isFallback(found.source) || isFallback(channel.source))) {
+      audit(
+        found.source === "api" ? "warn" : "info",
+        "channel.source",
+        `${channel.handle} is now checked through ${found.source ? labelOf(found.source) : "no source"}`,
+      );
+    }
+
     let sent = 0;
     for (const stream of streams) {
       for (const hook of hooks) if (await deliver(hook, channel, found.channelName, stream, force)) sent++;
     }
-    return { sent, failed: false };
+    return { sent, failed: found.error !== null };
   } catch (err) {
     fail(key);
     const message = errorMessage(err);
@@ -180,6 +214,7 @@ async function run({ channelId, manual }: Scope): Promise<CheckSummary> {
   state.running = true;
   events.emit("changed");
   try {
+    expireManual.run(nowSec() - MANUAL_TTL_SEC);
     const hooks = enabledHooks.all();
     const hookById = new Map(hooks.map((h) => [h.id, h]));
     const linksByChannel = Object.groupBy(allLinks.all(), (l) => l.channel_id);

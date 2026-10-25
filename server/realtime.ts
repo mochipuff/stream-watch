@@ -1,9 +1,8 @@
-import crypto from "node:crypto";
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import type { WsMessage } from "../shared/contract.ts";
-import { hostAllowed } from "./config.ts";
+import { hostAllowed, originAllowed } from "./config.ts";
 import { overview } from "./overview.ts";
 import { events } from "./events.ts";
 
@@ -58,19 +57,6 @@ const heartbeat = setInterval(() => {
 }, 20_000);
 heartbeat.unref();
 
-// Browsers cannot send an Authorization header on a WebSocket, so the dashboard first trades its token
-// for a single-use, 30-second ticket. The long-lived token never appears in a URL.
-const tickets = new Map<string, number>();
-
-export function issueTicket(): string | null {
-  const now = Date.now();
-  for (const [ticket, expires] of tickets) if (expires < now) tickets.delete(ticket);
-  if (tickets.size >= 50) return null;
-  const ticket = crypto.randomBytes(18).toString("base64url");
-  tickets.set(ticket, now + 30_000);
-  return ticket;
-}
-
 export function attachRealtime(server: Server) {
   server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     socket.on("error", () => {}); // a reset socket after upgrade must not crash the process
@@ -80,20 +66,8 @@ export function attachRealtime(server: Server) {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname !== "/api/ws") return reject(404, "Not Found");
 
-    const ticket = url.searchParams.get("ticket") ?? "";
-    const expires = tickets.get(ticket);
-    tickets.delete(ticket); // single use, even when the other checks below fail
-
-    let sameOrigin = true;
-    if (req.headers.origin) {
-      try {
-        sameOrigin = new URL(req.headers.origin).host === req.headers.host;
-      } catch {
-        sameOrigin = false;
-      }
-    }
-    if (!hostAllowed(req.headers.host) || !sameOrigin) return reject(403, "Forbidden");
-    if (!expires || expires < Date.now()) return reject(401, "Unauthorized");
+    // No login: the Host and Origin checks are what keep other websites out.
+    if (!hostAllowed(req.headers.host) || !originAllowed(req.headers.origin, req.headers.host)) return reject(403, "Forbidden");
     if (wss.clients.size >= MAX_SOCKETS) return reject(503, "Service Unavailable");
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   });

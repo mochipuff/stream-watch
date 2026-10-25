@@ -1,5 +1,5 @@
 import { memo, useDeferredValue, useMemo, useState } from "react";
-import { MAX_MESSAGE_LENGTH } from "../shared/contract.ts";
+import { MAX_MANUAL_VIDEOS, MAX_MESSAGE_LENGTH } from "../shared/contract.ts";
 import type { ChannelDto, WebhookDto } from "../shared/contract.ts";
 import { api, useAction } from "./api.ts";
 import { ChipGroup, ConfirmButton, Dialog, RelativeTime, Row, Section, buttonCls, inputCls, quietCls } from "./ui.tsx";
@@ -9,7 +9,7 @@ const PAGE_SIZE = 10;
 type ChannelState = "active" | "paused" | "error";
 type Filter = "all" | ChannelState;
 
-const SOURCE_LABEL = { rss: "RSS", api: "YouTube API" } as const;
+const SOURCE_LABEL = { rss: "RSS", scrape: "page scraping", api: "YouTube API", manual: "manual videos only" } as const;
 
 // An error only counts while the channel is actually checked: one with no active webhook is skipped, so its error is stale.
 function stateOf(channel: ChannelDto, activeHooks: number): ChannelState {
@@ -163,6 +163,68 @@ function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClo
   );
 }
 
+function ChannelVideosDialog({ channel, onClose }: { channel: ChannelDto; onClose: () => void }) {
+  const [url, setUrl] = useState("");
+  const add = useAction((link: string) => api.addVideo(channel.id, { url: link }), "Video added. Press Check to read it now.");
+  const remove = useAction((videoId: string) => api.removeVideo(channel.id, videoId));
+
+  return (
+    <Dialog
+      title={`Videos for ${channel.handle}`}
+      hint="Paste a stream or premiere link. It is checked with this channel even when RSS, page scraping and the API all fail, and removed once it is no longer live or upcoming."
+      onClose={onClose}
+    >
+      <form
+        className="mt-4 flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          add.mutate(url, { onSuccess: () => setUrl("") });
+        }}
+      >
+        <input
+          className={`${inputCls} min-w-0 flex-1`}
+          aria-label="YouTube video link"
+          placeholder="https://www.youtube.com/watch?v=…"
+          autoComplete="off"
+          spellCheck={false}
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          required
+        />
+        <button className={buttonCls} disabled={add.isPending || channel.manualVideos.length >= MAX_MANUAL_VIDEOS}>
+          Add
+        </button>
+      </form>
+      <ul className="mt-3 max-h-60 overflow-y-auto">
+        {channel.manualVideos.length === 0 && <li className="py-2 text-xs text-muted">No videos added by hand.</li>}
+        {channel.manualVideos.map((v) => (
+          <li key={v.videoId} className="flex items-center justify-between gap-3 border-t border-line py-2 first:border-t-0">
+            <a
+              className="truncate font-mono text-xs underline"
+              href={`https://www.youtube.com/watch?v=${v.videoId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {v.videoId}
+            </a>
+            <span className="shrink-0 text-xs text-muted">
+              added <RelativeTime at={v.addedAt * 1000} />
+            </span>
+            <button className={quietCls} disabled={remove.isPending} onClick={() => remove.mutate(v.videoId)}>
+              Remove
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="mt-5 flex justify-end">
+        <button className={quietCls} onClick={onClose}>
+          Close
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
 interface ChannelRowProps {
   channel: ChannelDto;
   activeHooks: number;
@@ -170,12 +232,13 @@ interface ChannelRowProps {
   checkBlocked: boolean;
   onEdit: (id: string) => void;
   onMessage: (id: string) => void;
+  onVideos: (id: string) => void;
   onCheck: (id: string) => void;
   onToggle: (v: { id: string; enabled: boolean }) => void;
   onRemove: (id: string) => void;
 }
 
-const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkBlocked, onEdit, onMessage, onCheck, onToggle, onRemove }: ChannelRowProps) {
+const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkBlocked, onEdit, onMessage, onVideos, onCheck, onToggle, onRemove }: ChannelRowProps) {
   const total = channel.webhookIds.length;
   return (
     <Row
@@ -194,6 +257,12 @@ const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkB
             className="shrink-0 cursor-pointer rounded border border-line bg-paper px-2 py-0.5 text-[11px] font-normal text-muted hover:text-ink"
           >
             {channel.message ? "Message ✓" : "Message"}
+          </button>
+          <button
+            onClick={() => onVideos(channel.id)}
+            className="shrink-0 cursor-pointer rounded border border-line bg-paper px-2 py-0.5 text-[11px] font-normal text-muted hover:text-ink"
+          >
+            {channel.manualVideos.length > 0 ? `Videos (${channel.manualVideos.length})` : "Videos"}
           </button>
         </span>
       }
@@ -252,6 +321,7 @@ function Pagination({ page, pageCount, total, onPage }: { page: number; pageCoun
 export const ChannelsSection = memo(function ChannelsSection({ channels, webhooks, running }: { channels: readonly ChannelDto[]; webhooks: readonly WebhookDto[]; running: boolean }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [messageId, setMessageId] = useState<string | null>(null);
+  const [videosId, setVideosId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [page, setPage] = useState(0);
@@ -285,11 +355,13 @@ export const ChannelsSection = memo(function ChannelsSection({ channels, webhook
   const rows = matches.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE);
   const editing = channels.find((c) => c.id === editingId);
   const messaging = channels.find((c) => c.id === messageId);
+  const videoEditing = channels.find((c) => c.id === videosId);
 
   return (
     <Section title="Channels" hint="Every handle can send to its own webhooks, or to several at once.">
       {editing && <ChannelWebhooksDialog key={editing.id} channel={editing} webhooks={webhooks} onClose={() => setEditingId(null)} />}
       {messaging && <ChannelMessageDialog key={messaging.id} channel={messaging} onClose={() => setMessageId(null)} />}
+      {videoEditing && <ChannelVideosDialog key={videoEditing.id} channel={videoEditing} onClose={() => setVideosId(null)} />}
       <AddChannelForm webhooks={webhooks} />
       {channels.length > 0 && (
         <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -334,6 +406,7 @@ export const ChannelsSection = memo(function ChannelsSection({ channels, webhook
             checkBlocked={running || check.isPending}
             onEdit={setEditingId}
             onMessage={setMessageId}
+            onVideos={setVideosId}
             onCheck={check.mutate}
             onToggle={toggle.mutate}
             onRemove={remove.mutate}

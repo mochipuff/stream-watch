@@ -5,6 +5,7 @@ export const MAX_INTERVAL_MS = 86_400_000;
 export const MAX_CHANNELS = 500;
 export const MAX_MESSAGE_LENGTH = 1000;
 export const MAX_ROLES_PER_CHANNEL = 10;
+export const MAX_MANUAL_VIDEOS = 10; // per channel
 
 export const HANDLE_RE = /^@[A-Za-z0-9._-]{3,30}$/;
 export const ROLE_ID_RE = /^\d{17,20}$/; // Discord snowflake
@@ -12,6 +13,22 @@ export const VIDEO_ID_RE = /^[\w-]{11}$/;
 export const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 export const WEBHOOK_RE =
   /^https:\/\/(?:(?:canary|ptb)\.)?(?:discord|discordapp)\.com\/api(?:\/v\d+)?\/webhooks\/\d{15,25}\/[\w-]{20,}$/;
+
+/** Accepts a bare 11-character id or a watch / live / shorts / embed / youtu.be link. Returns null for anything else. */
+export function parseVideoId(input: string): string | null {
+  const text = input.trim();
+  if (VIDEO_ID_RE.test(text)) return text;
+  try {
+    const url = new URL(text.includes("://") ? text : `https://${text}`);
+    const host = url.hostname.replace(/^(?:www|m|music)\./, "");
+    let id: string | null | undefined;
+    if (host === "youtu.be") id = url.pathname.split("/")[1];
+    else if (host === "youtube.com") id = url.searchParams.get("v") ?? /^\/(?:live|shorts|embed)\/([\w-]{11})(?:\/|$)/.exec(url.pathname)?.[1];
+    return id && VIDEO_ID_RE.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
 
 const PROXY_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:"]);
 
@@ -44,6 +61,12 @@ const roleIds = z
   .array(z.string().trim().regex(ROLE_ID_RE, "A role id is 17 to 20 digits"))
   .max(MAX_ROLES_PER_CHANNEL, `At most ${MAX_ROLES_PER_CHANNEL} roles per channel`)
   .transform((ids) => [...new Set(ids)]);
+const videoRef = z
+  .string()
+  .trim()
+  .max(300)
+  .refine((s) => parseVideoId(s) !== null, "Not a YouTube video link or id")
+  .transform((s) => parseVideoId(s)!);
 const proxyUrl = z
   .string()
   .trim()
@@ -55,6 +78,7 @@ const proxyUrl = z
 export const schemas = {
   channelCreate: z.object({ handle, webhookIds: webhookIds.default([]) }),
   channelPatch: z.object({ enabled: z.boolean().optional(), webhookIds: webhookIds.optional(), message: message.optional(), roleIds: roleIds.optional() }),
+  manualVideoCreate: z.object({ url: videoRef }),
   webhookCreate: z.object({ name, url: z.string().trim().regex(WEBHOOK_RE, "Invalid Discord webhook URL") }),
   webhookPatch: z.object({ enabled: z.boolean().optional(), name: name.optional() }),
   settings: z
@@ -66,6 +90,10 @@ export const schemas = {
         .optional(),
       auto: z.boolean().optional(),
       proxyUrl: proxyUrl.optional(),
+      sources: z
+        .object({ rss: z.boolean().optional(), scrape: z.boolean().optional(), api: z.boolean().optional() })
+        .refine((v) => Object.values(v).some((x) => x !== undefined), "Nothing to change")
+        .optional(),
     })
     .refine((v) => Object.values(v).some((x) => x !== undefined), "Nothing to change"),
   auditQuery: z.object({
@@ -77,12 +105,21 @@ export const schemas = {
 
 export type ChannelCreateInput = z.input<typeof schemas.channelCreate>;
 export type ChannelPatchInput = z.input<typeof schemas.channelPatch>;
+export type ManualVideoCreateInput = z.input<typeof schemas.manualVideoCreate>;
 export type WebhookCreateInput = z.input<typeof schemas.webhookCreate>;
 export type WebhookPatchInput = z.input<typeof schemas.webhookPatch>;
 export type SettingsInput = z.input<typeof schemas.settings>;
 
 export type StreamStatus = "upcoming" | "live";
-export type CheckSource = "rss" | "api";
+export const SOURCE_NAMES = ["rss", "scrape", "api"] as const;
+export type SourceName = (typeof SOURCE_NAMES)[number];
+/** Where a channel's last answer came from. `manual` = only the videos added by hand were read. */
+export type CheckSource = SourceName | "manual";
+
+export interface ManualVideoDto {
+  videoId: string;
+  addedAt: number; // unix seconds
+}
 
 export interface ChannelDto {
   id: string;
@@ -97,6 +134,7 @@ export interface ChannelDto {
   webhookIds: string[];
   message: string | null; // custom Discord text; `{user}` = the handle, `@{roleid}` = the roles below
   roleIds: string[];
+  manualVideos: ManualVideoDto[];
 }
 
 export interface WebhookDto {
@@ -127,8 +165,15 @@ export interface CycleDto {
   nextCycleAt: number | null; // unix milliseconds, null while auto checks are off
 }
 
+export interface SourceStateDto {
+  enabled: boolean; // the switch in the dashboard
+  configured: boolean; // false only for the API without a key
+  pausedUntil: number | null; // unix milliseconds, set while the source is backing off after repeated failures
+  error: string | null; // the last failure
+}
+
 export interface SourcesDto {
-  apiConfigured: boolean;
+  sources: Record<SourceName, SourceStateDto>;
   proxy: { url: string; healthy: boolean; error: string | null } | null; // url never contains credentials
 }
 

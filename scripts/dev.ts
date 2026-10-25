@@ -1,7 +1,6 @@
 // `npm run dev`: starts the API (node --watch), waits until it answers, then starts Vite.
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { parseEnv } from "node:util";
 
 if (Number(process.versions.node.split(".")[0]) < 24) {
@@ -15,17 +14,8 @@ if (!existsSync(VITE)) {
   process.exit(1);
 }
 
-// The server refuses to start without ADMIN_TOKEN, so the first run writes a random one to .env.
-let envText = readFileSync(existsSync(".env") ? ".env" : ".env.example", "utf8");
-if ((process.env.ADMIN_TOKEN ?? "").length < 16 && (parseEnv(envText).ADMIN_TOKEN ?? "").length < 16) {
-  const token = randomBytes(24).toString("base64url");
-  const line = `ADMIN_TOKEN=${token}`;
-  envText = /^ADMIN_TOKEN=.*$/m.test(envText) ? envText.replace(/^ADMIN_TOKEN=.*$/m, line) : `${envText.trimEnd()}\n${line}\n`;
-  writeFileSync(".env", envText, { mode: 0o600 });
-  console.log(`[dev] Wrote a random ADMIN_TOKEN to .env. Use it to log in: ${token}`);
-}
-
-const env = { ...parseEnv(envText), ...process.env };
+// Only HOST and PORT are needed here, to find the API. The server itself reads .env through --env-file-if-exists.
+const env = { ...(existsSync(".env") ? parseEnv(readFileSync(".env", "utf8")) : {}), ...process.env };
 const host = env.HOST && !["0.0.0.0", "::"].includes(env.HOST) ? env.HOST : "127.0.0.1";
 const healthUrl = `http://${host}:${env.PORT || 8787}/api/health`;
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { WsMessage } from "../shared/contract.ts";
-import { AUDIT_KEY, ApiError, api, applyOverview, queryClient } from "./api.ts";
+import { AUDIT_KEY, applyOverview, queryClient } from "./api.ts";
 import { toast } from "./toast.ts";
 
 function parse(data: unknown): WsMessage | null {
@@ -19,7 +19,7 @@ export function useRealtime(): boolean {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    // `disposed` stops a late reconnect after the dashboard unmounts (Lock) or StrictMode remounts it.
+    // `disposed` stops a late reconnect after the dashboard unmounts or StrictMode remounts it.
     let disposed = false;
     let socket: WebSocket | undefined;
     let retry: ReturnType<typeof setTimeout> | undefined;
@@ -29,18 +29,10 @@ export function useRealtime(): boolean {
       if (!disposed) retry = setTimeout(connect, Math.min(1000 * 2 ** attempt++, 15_000));
     };
 
-    async function connect() {
-      let ticket: string;
-      try {
-        ({ ticket } = await api.ticket());
-      } catch (err) {
-        if (!(err instanceof ApiError && err.status === 401)) reconnect(); // 401 means the dashboard just locked
-        return;
-      }
+    function connect() {
       if (disposed) return;
-
       const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${scheme}://${window.location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
+      const ws = new WebSocket(`${scheme}://${window.location.host}/api/ws`);
       socket = ws;
       ws.onopen = () => {
         attempt = 0;
@@ -80,7 +72,7 @@ export function useRealtime(): boolean {
       };
     }
 
-    void connect();
+    connect();
 
     return () => {
       disposed = true;

@@ -1,8 +1,8 @@
 import { memo, useState } from "react";
 import { MAX_INTERVAL_MS, MIN_INTERVAL_MS } from "../shared/contract.ts";
-import type { CycleDto, RecentDto, SourcesDto, WebhookDto } from "../shared/contract.ts";
+import type { CycleDto, RecentDto, SourceStateDto, SourcesDto, WebhookDto } from "../shared/contract.ts";
 import { api, useAction } from "./api.ts";
-import { ConfirmButton, RelativeTime, Row, Section, buttonCls, inputCls, quietCls } from "./ui.tsx";
+import { ConfirmButton, RelativeTime, Row, Section, buttonCls, inputCls, quietCls, useNow } from "./ui.tsx";
 
 const dateTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const fmtTime = (unix: number | null) => (unix ? dateTime.format(unix * 1000) : "no start time");
@@ -173,17 +173,47 @@ function ProxyForm() {
   );
 }
 
+const SOURCE_ROWS = [
+  { name: "rss", title: "RSS feed", detail: "Small and quick: the channel's recent uploads. YouTube answers it with a 404 or 500 now and then." },
+  { name: "scrape", title: "Page scraping", detail: "Reads the channel's streams page and each video's watch page. No key needed. Also confirms every RSS result." },
+  { name: "api", title: "YouTube API v3", detail: "Last resort, only when RSS and page scraping both fail. Needs YOUTUBE_API_KEY in .env." },
+] as const;
+
+function SourceRow({ row, state }: { row: (typeof SOURCE_ROWS)[number]; state: SourceStateDto }) {
+  const toggle = useAction(() => api.saveSettings({ sources: { [row.name]: !state.enabled } }));
+  const now = useNow();
+  const resting = state.enabled && state.configured && state.pausedUntil !== null;
+  const detail = !state.configured
+    ? "Not set. Add YOUTUBE_API_KEY to .env and restart to enable it."
+    : !state.enabled
+      ? "Off"
+      : resting
+        ? `Resting for ${Math.max(1, Math.ceil((state.pausedUntil! - now) / 1000))}s after repeated failures, so it is not hit every cycle`
+        : row.detail;
+  return (
+    <Row title={row.title} detail={detail} error={resting ? state.error : null}>
+      {state.configured && (
+        <button className={quietCls} disabled={toggle.isPending} onClick={() => toggle.mutate()}>
+          {state.enabled ? "Turn off" : "Turn on"}
+        </button>
+      )}
+    </Row>
+  );
+}
+
 export const SourcesSection = memo(function SourcesSection({ sources }: { sources: SourcesDto }) {
   const clear = useAction(() => api.saveSettings({ proxyUrl: null }), "Proxy removed.");
-  const { proxy, apiConfigured } = sources;
+  const { proxy } = sources;
 
   return (
-    <Section title="Sources and proxy" hint="Channels are read from the YouTube RSS feed. If that fails, the YouTube API takes over when a key is set.">
+    <Section
+      title="Sources and proxy"
+      hint="Each source can answer on its own. A failing one rests for a while and the next one takes over. With all three off, only videos added by hand are checked."
+    >
       <ul className="mb-4">
-        <Row
-          title="YouTube API v3 fallback"
-          detail={apiConfigured ? "Key set. Used only when RSS fails." : "Not set. Add YOUTUBE_API_KEY to .env and restart to enable it."}
-        />
+        {SOURCE_ROWS.map((row) => (
+          <SourceRow key={row.name} row={row} state={sources.sources[row.name]} />
+        ))}
         <Row
           title="Proxy"
           detail={proxy ? `${proxy.url}, ${proxy.healthy ? "ready" : "not working"}` : "None, direct connection"}

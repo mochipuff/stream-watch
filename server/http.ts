@@ -91,3 +91,60 @@ export async function ytFetch(url: string, { timeoutMs, ...init }: YtRequest) {
   }
   return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
+
+// ---------- Shared by every YouTube source ----------
+
+export const REQUEST_TIMEOUT_MS = 8000;
+
+export const PAGE_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "accept-language": "en-US,en;q=0.9",
+  cookie: "CONSENT=YES+1; SOCS=CAI",
+};
+
+export class HttpError extends Error {
+  status: number;
+  constructor(status: number) {
+    super(`YouTube HTTP ${status}`);
+    this.status = status;
+  }
+}
+
+/** The channel does not exist. Permanent: no other source can change that. */
+export class NotFoundError extends Error {}
+
+/** YouTube is asking for a consent click, a sign-in or a bot check. Retrying right away only makes it worse. */
+export class BlockedError extends Error {}
+
+/** Throttling: back off for minutes, not seconds. */
+export const isThrottle = (err: unknown) => err instanceof BlockedError || (err instanceof HttpError && err.status === 429);
+
+const NETWORK_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"]);
+
+/** This machine is offline or DNS is down. That says nothing about whether one YouTube source is healthy. */
+export function isNetworkError(err: unknown): boolean {
+  const cause: unknown = err instanceof Error ? err.cause : null;
+  const code = cause && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+  return NETWORK_CODES.has(code);
+}
+
+type Res = Awaited<ReturnType<typeof ytFetch>>;
+
+export async function ensureOk(res: Res) {
+  if (res.ok) return;
+  await res.body?.cancel().catch(() => {});
+  throw new HttpError(res.status);
+}
+
+export async function readBounded(res: Res, maxBytes: number): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  for await (const chunk of res.body ?? []) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) throw new Error("YouTube response is too large");
+    text += decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
+}

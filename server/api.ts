@@ -4,47 +4,42 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { z } from "zod";
-import { MAX_CHANNELS, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts";
+import { MAX_CHANNELS, MAX_MANUAL_VIDEOS, SOURCE_NAMES, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts";
 import type { StreamStatus } from "../shared/contract.ts";
 import { audit, readAudit } from "./audit.ts";
-import { ADMIN_TOKEN, errorMessage, hostAllowed } from "./config.ts";
+import { errorMessage, guardRequest } from "./config.ts";
 import { parseRoleIds, query, setSetting, tx } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
 import { configureProxy, proxyStatus } from "./http.ts";
 import { cycle, overview } from "./overview.ts";
 import { CheckRejectedError, forget, reschedule, startCheck } from "./poller.ts";
-import { issueTicket } from "./realtime.ts";
-import { thumbnailFor } from "./youtube.ts";
+import { SOURCE_LABEL, reset as resetSource } from "./sources.ts";
+import { forgetVideo, thumbnailFor } from "./youtube.ts";
 
 const HttpError = (status: ContentfulStatusCode, message: string) => new HTTPException(status, { message });
 
-const digest = (value: string) => crypto.createHash("sha256").update(value).digest();
-const TOKEN_DIGEST = digest(ADMIN_TOKEN);
-let failures = { count: 0, resetAt: 0 };
-
 export const app = new Hono();
 
+// There is no login. The API listens on 127.0.0.1 only (config.ts refuses anything else), and every request must come from
+// this machine's own dashboard: a website open in the browser cannot reach it, even by rebinding its DNS name.
 app.use("*", async (c, next) => {
-  if (!hostAllowed(c.req.header("host"))) return c.json({ error: "Forbidden host" }, 403);
+  const refused = guardRequest({
+    method: c.req.method,
+    host: c.req.header("host"),
+    origin: c.req.header("origin"),
+    secFetchSite: c.req.header("sec-fetch-site"),
+    contentType: c.req.header("content-type"),
+  });
+  if (refused) return c.json({ error: refused.error }, refused.status);
   c.header("cache-control", "no-store");
   c.header("x-content-type-options", "nosniff");
   await next();
 });
 
-// Unauthenticated on purpose: `npm run dev` polls it to know the API is up. Reveals nothing.
+// `npm run dev` polls it to know the API is up. Reveals nothing.
 app.get("/api/health", (c) => c.json({ ok: true }));
 
-app.use("/api/*", async (c, next) => {
-  if (failures.count >= 30 && Date.now() < failures.resetAt) return c.json({ error: "Too many attempts, wait a minute" }, 429);
-  const match = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "");
-  if (!match || !crypto.timingSafeEqual(digest(match[1]!.trim()), TOKEN_DIGEST)) {
-    if (Date.now() >= failures.resetAt) failures = { count: 0, resetAt: Date.now() + 60_000 };
-    failures.count++;
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-  await next();
-});
 app.use("/api/*", bodyLimit({ maxSize: 16 * 1024, onError: (c) => c.json({ error: "Payload too large" }, 413) }));
 
 app.onError((err, c) => {
@@ -83,6 +78,9 @@ const setChannelEnabled = query("UPDATE channels SET enabled = ? WHERE id = ?");
 const setChannelMessage = query("UPDATE channels SET message = ? WHERE id = ?");
 const setChannelRoles = query("UPDATE channels SET role_ids = ? WHERE id = ?");
 const deleteChannel = query("DELETE FROM channels WHERE id = ?"); // links go with it (ON DELETE CASCADE)
+const manualCount = query<{ n: number }>("SELECT COUNT(*) AS n FROM manual_videos WHERE channel_id = ?");
+const insertManual = query("INSERT OR IGNORE INTO manual_videos (channel_id, video_id, added_at) VALUES (?, ?, ?)");
+const deleteManual = query("DELETE FROM manual_videos WHERE channel_id = ? AND video_id = ?");
 const clearLinks = query("DELETE FROM channel_webhooks WHERE channel_id = ?");
 const insertLink = query("INSERT OR IGNORE INTO channel_webhooks (channel_id, webhook_id) VALUES (?, ?)");
 
@@ -120,12 +118,6 @@ function setLinks(channelId: string, webhookIds: string[]) {
     throw HttpError(400, "Unknown webhook selected"); // foreign key failed; the surrounding tx rolls back
   }
 }
-
-app.post("/api/ws-ticket", (c) => {
-  const ticket = issueTicket();
-  if (!ticket) throw HttpError(429, "Too many pending tickets");
-  return c.json({ ticket });
-});
 
 app.get("/api/overview", (c) => c.json(overview()));
 app.get("/api/cycle", (c) => c.json(cycle()));
@@ -189,6 +181,30 @@ app.post("/api/channels/:id/check", (c) => {
   if (!row) throw HttpError(404, "Channel not found");
   if (!row.enabled) throw HttpError(409, "Channel is paused");
   return runCheck(c, id);
+});
+
+// A video added by hand is checked together with its channel, so it still works while RSS, page scraping and the API all fail.
+app.post("/api/channels/:id/videos", async (c) => {
+  const id = paramId(c);
+  const { url: videoId } = await parseBody(c, schemas.manualVideoCreate);
+  const row = tx(() => {
+    const current = channelRow.get(id);
+    if (!current) throw HttpError(404, "Channel not found");
+    if ((manualCount.get(id)?.n ?? 0) >= MAX_MANUAL_VIDEOS) throw HttpError(409, `At most ${MAX_MANUAL_VIDEOS} videos per channel`);
+    insertManual.run(id, videoId, Math.floor(Date.now() / 1000));
+    return current;
+  });
+  forgetVideo(videoId); // read it afresh, even if an earlier check had filed it as a plain video
+  audit("info", "video.added", `Added video ${videoId} to ${row.handle}`);
+  return changed(c, 201);
+});
+
+app.delete("/api/channels/:id/videos/:videoId", (c) => {
+  const id = paramId(c);
+  const videoId = c.req.param("videoId");
+  if (!VIDEO_ID_RE.test(videoId) || Number(deleteManual.run(id, videoId).changes) === 0) throw HttpError(404, "Video not found");
+  audit("info", "video.removed", `Removed video ${videoId} from ${channelRow.get(id)?.handle ?? "a channel"}`);
+  return changed(c);
 });
 
 app.delete("/api/channels/:id", (c) => {
@@ -301,6 +317,15 @@ app.put("/api/settings", async (c) => {
   if (body.intervalMs !== undefined) {
     setSetting("intervalMs", String(body.intervalMs));
     audit("info", "settings.interval", `Check interval set to ${body.intervalMs / 1000}s`);
+  }
+  if (body.sources) {
+    for (const name of SOURCE_NAMES) {
+      const on = body.sources[name];
+      if (on === undefined) continue;
+      setSetting(`source.${name}`, on ? "1" : "0");
+      if (on) resetSource(name); // switching back on is a request to try again now
+      audit("info", "settings.source", `${SOURCE_LABEL[name]} turned ${on ? "on" : "off"}`);
+    }
   }
   if (body.auto !== undefined) {
     setSetting("auto", body.auto ? "1" : "0");
