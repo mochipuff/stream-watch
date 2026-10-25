@@ -1,8 +1,8 @@
 import { memo, useState } from "react";
-import { MAX_INTERVAL_MS, MIN_INTERVAL_MS } from "../shared/contract.ts";
+import { KIND_LABEL, MAX_INTERVAL_MS, MIN_INTERVAL_MS } from "../shared/contract.ts";
 import type { CycleDto, RecentDto, SourceStateDto, SourcesDto, WebhookDto } from "../shared/contract.ts";
 import { api, useAction } from "./api.ts";
-import { ConfirmButton, RelativeTime, Row, Section, buttonCls, inputCls, quietCls, useNow } from "./ui.tsx";
+import { MenuButton, RelativeTime, Row, Section, buttonCls, inputCls, quietCls, useNow } from "./ui.tsx";
 
 const dateTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const fmtTime = (unix: number | null) => (unix ? dateTime.format(unix * 1000) : "no start time");
@@ -57,13 +57,14 @@ interface WebhookRowProps {
 const WebhookRow = memo(function WebhookRow({ webhook: w, busy, onTest, onToggle, onRemove }: WebhookRowProps) {
   return (
     <Row title={w.name} detail={w.enabled ? w.preview : `Paused, ${w.preview}`} error={w.error}>
-      <button className={quietCls} disabled={busy} onClick={() => onTest(w.id)}>
-        Send test
-      </button>
-      <button className={quietCls} disabled={busy} onClick={() => onToggle({ id: w.id, enabled: !w.enabled })}>
-        {w.enabled ? "Pause" : "Resume"}
-      </button>
-      <ConfirmButton label="Remove" disabled={busy} onConfirm={() => onRemove(w.id)} />
+      <MenuButton
+        label={`Actions for ${w.name}`}
+        actions={[
+          { label: "Send test", disabled: busy, onSelect: () => onTest(w.id) },
+          { label: w.enabled ? "Pause" : "Resume", disabled: busy, onSelect: () => onToggle({ id: w.id, enabled: !w.enabled }) },
+          { label: "Remove", disabled: busy, confirm: true, onSelect: () => onRemove(w.id) },
+        ]}
+      />
     </Row>
   );
 });
@@ -232,13 +233,19 @@ export const SourcesSection = memo(function SourcesSection({ sources }: { source
   );
 });
 
+function whenOf({ status, startAt }: RecentDto): string {
+  if (status === "live") return "live";
+  if (status === "upcoming") return `starts ${fmtTime(startAt)}`;
+  return `${KIND_LABEL[status]}${startAt ? `, published ${fmtTime(startAt)}` : ""}`;
+}
+
 const RecentRow = memo(function RecentRow({ item: r, busy, onResend }: { item: RecentDto; busy: boolean; onResend: (r: RecentDto) => void }) {
   return (
     <Row
       title={r.title}
       detail={
         <>
-          {r.handle} to {r.webhook}, {r.status === "live" ? "live" : `starts ${fmtTime(r.startAt)}`}, sent <RelativeTime at={r.sentAt * 1000} />
+          {r.handle} to {r.webhook}, {whenOf(r)}, sent <RelativeTime at={r.sentAt * 1000} />
         </>
       }
     >
@@ -260,7 +267,7 @@ export const RecentSection = memo(function RecentSection({ recent }: { recent: r
   return (
     <Section title="Recently sent">
       <ul>
-        {recent.length === 0 && <li className="py-1 text-sm text-muted">Nothing sent yet. Streams appear here once announced.</li>}
+        {recent.length === 0 && <li className="py-1 text-sm text-muted">Nothing sent yet. Streams, VODs and Shorts appear here once announced.</li>}
         {recent.map((r) => (
           <RecentRow
             key={`${r.webhookId}-${r.videoId}`}

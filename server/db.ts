@@ -1,8 +1,8 @@
 import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { MAX_INTERVAL_MS, MIN_INTERVAL_MS, ROLE_ID_RE } from "../shared/contract.ts";
-import type { SourceName } from "../shared/contract.ts";
+import { CONTENT_KINDS, MAX_INTERVAL_MS, MAX_MESSAGE_LENGTH, MIN_INTERVAL_MS, ROLE_ID_RE } from "../shared/contract.ts";
+import type { ContentKind, SourceName } from "../shared/contract.ts";
 
 export const DB_FILE = resolve(process.env.DB_PATH || "data/app.db");
 mkdirSync(dirname(DB_FILE), { recursive: true });
@@ -19,10 +19,14 @@ PRAGMA busy_timeout = 5000;
 // so a database from any earlier release, including one that predates version tracking (user_version 0), is brought
 // forward without losing data. Never edit a released step: add a new one at the end.
 
+function hasColumn(table: string, column: string) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
+  return columns.some((col) => col.name === column);
+}
+
 // SQLite has no ADD COLUMN IF NOT EXISTS, so the table is checked first.
 function addColumnIfMissing(table: string, column: string, definition: string) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
-  if (!columns.some((col) => col.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  if (!hasColumn(table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 const MIGRATIONS: readonly { version: number; up: () => void }[] = [
@@ -102,6 +106,27 @@ const MIGRATIONS: readonly { version: number; up: () => void }[] = [
           PRIMARY KEY (channel_id, video_id)
         );
       `);
+    },
+  },
+  {
+    // One message and one on/off switch per kind (upcoming, live, vod, short) instead of a single message per channel.
+    // `channels.kinds` holds them as JSON. The old single message becomes the upcoming and live message, which is
+    // exactly what it was used for. `plain_videos` now also remembers what a finished video is (vod or short) so it is read once.
+    version: 3,
+    up() {
+      addColumnIfMissing("channels", "kinds", "TEXT");
+      addColumnIfMissing("plain_videos", "kind", "TEXT");
+      addColumnIfMissing("plain_videos", "title", "TEXT");
+      addColumnIfMissing("plain_videos", "published_at", "INTEGER");
+      addColumnIfMissing("plain_videos", "channel_id", "TEXT");
+      if (hasColumn("channels", "message")) {
+        db.exec(`
+          UPDATE channels
+          SET kinds = json_object('upcoming', json_object('message', message), 'live', json_object('message', message))
+          WHERE message IS NOT NULL AND kinds IS NULL;
+          ALTER TABLE channels DROP COLUMN message;
+        `);
+      }
     },
   },
 ];
@@ -191,6 +216,42 @@ export function getIntervalMs(): number {
 
 // Stored as "id,id"; anything that is not a role id is dropped on read, so a damaged row can never inject a mention.
 export const parseRoleIds = (raw: string | null): string[] => (raw ?? "").split(",").filter((id) => ROLE_ID_RE.test(id));
+
+export interface KindSetting {
+  enabled: boolean;
+  message: string | null;
+  /** Unix seconds when the kind was switched on. A VOD or Short published before that is never announced, so switching it on does not replay the back catalogue. */
+  since: number;
+}
+export type KindSettings = Record<ContentKind, KindSetting>;
+
+// Streams were always announced; VODs and Shorts are opt-in.
+const ENABLED_BY_DEFAULT: Record<ContentKind, boolean> = { upcoming: true, live: true, vod: false, short: false };
+
+/** Reads `channels.kinds`. Anything damaged or missing falls back to the defaults, so a bad row can never announce more than intended. */
+export function parseKinds(raw: string | null): KindSettings {
+  let stored: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object") stored = parsed as Record<string, unknown>;
+  } catch {
+    // damaged JSON: defaults
+  }
+  return Object.fromEntries(
+    CONTENT_KINDS.map((kind) => {
+      const entry = (stored[kind] ?? {}) as Record<string, unknown>;
+      const message = typeof entry.message === "string" ? entry.message.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
+      return [
+        kind,
+        {
+          enabled: typeof entry.enabled === "boolean" ? entry.enabled : ENABLED_BY_DEFAULT[kind],
+          message: message || null,
+          since: typeof entry.since === "number" && Number.isFinite(entry.since) ? entry.since : 0,
+        },
+      ];
+    }),
+  ) as KindSettings;
+}
 
 export const isAutoEnabled = () => getSetting("auto") !== "0";
 

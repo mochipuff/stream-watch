@@ -4,6 +4,11 @@ export const MIN_INTERVAL_MS = 30_000;
 export const MAX_INTERVAL_MS = 86_400_000;
 export const MAX_CHANNELS = 500;
 export const MAX_MESSAGE_LENGTH = 1000;
+
+/** What a notification is about. `vod` = a finished stream or a regular upload, `short` = a YouTube Short. */
+export const CONTENT_KINDS = ["upcoming", "live", "vod", "short"] as const;
+export type ContentKind = (typeof CONTENT_KINDS)[number];
+export const KIND_LABEL: Record<ContentKind, string> = { upcoming: "Upcoming", live: "Live", vod: "VOD", short: "Shorts" };
 export const MAX_ROLES_PER_CHANNEL = 10;
 export const MAX_MANUAL_VIDEOS = 10; // per channel
 
@@ -57,6 +62,7 @@ const message = z
   .max(MAX_MESSAGE_LENGTH, `Message is too long (max ${MAX_MESSAGE_LENGTH})`)
   .nullable()
   .transform((s) => s?.trim() || null);
+const kindPatch = z.object({ enabled: z.boolean().optional(), message: message.optional() });
 const roleIds = z
   .array(z.string().trim().regex(ROLE_ID_RE, "A role id is 17 to 20 digits"))
   .max(MAX_ROLES_PER_CHANNEL, `At most ${MAX_ROLES_PER_CHANNEL} roles per channel`)
@@ -77,7 +83,12 @@ const proxyUrl = z
 
 export const schemas = {
   channelCreate: z.object({ handle, webhookIds: webhookIds.default([]) }),
-  channelPatch: z.object({ enabled: z.boolean().optional(), webhookIds: webhookIds.optional(), message: message.optional(), roleIds: roleIds.optional() }),
+  channelPatch: z.object({
+    enabled: z.boolean().optional(),
+    webhookIds: webhookIds.optional(),
+    kinds: z.object({ upcoming: kindPatch.optional(), live: kindPatch.optional(), vod: kindPatch.optional(), short: kindPatch.optional() }).optional(),
+    roleIds: roleIds.optional(),
+  }),
   manualVideoCreate: z.object({ url: videoRef }),
   webhookCreate: z.object({ name, url: z.string().trim().regex(WEBHOOK_RE, "Invalid Discord webhook URL") }),
   webhookPatch: z.object({ enabled: z.boolean().optional(), name: name.optional() }),
@@ -110,7 +121,6 @@ export type WebhookCreateInput = z.input<typeof schemas.webhookCreate>;
 export type WebhookPatchInput = z.input<typeof schemas.webhookPatch>;
 export type SettingsInput = z.input<typeof schemas.settings>;
 
-export type StreamStatus = "upcoming" | "live";
 export const SOURCE_NAMES = ["rss", "scrape", "api"] as const;
 export type SourceName = (typeof SOURCE_NAMES)[number];
 /** Where a channel's last answer came from. `manual` = only the videos added by hand were read. */
@@ -119,6 +129,11 @@ export type CheckSource = SourceName | "manual";
 export interface ManualVideoDto {
   videoId: string;
   addedAt: number; // unix seconds
+}
+
+export interface KindSettingDto {
+  enabled: boolean; // announce this kind for the channel
+  message: string | null; // custom Discord text; `{user}` = the handle, `@{roleid}` = the roles of the channel
 }
 
 export interface ChannelDto {
@@ -132,7 +147,7 @@ export interface ChannelDto {
   source: CheckSource | null;
   error: string | null;
   webhookIds: string[];
-  message: string | null; // custom Discord text; `{user}` = the handle, `@{roleid}` = the roles below
+  kinds: Record<ContentKind, KindSettingDto>;
   roleIds: string[];
   manualVideos: ManualVideoDto[];
 }
@@ -151,9 +166,9 @@ export interface RecentDto {
   title: string;
   handle: string;
   webhook: string;
-  status: StreamStatus;
+  status: ContentKind;
   canResend: boolean;
-  startAt: number | null; // unix seconds
+  startAt: number | null; // unix seconds: the start of a stream, or the publish time of a VOD or Short
   sentAt: number; // unix seconds
 }
 

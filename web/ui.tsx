@@ -101,27 +101,104 @@ export function ChipGroup<T extends string>({ label, options, value, onChange }:
   );
 }
 
-// A destructive action needs a second click within 3 seconds.
-export function ConfirmButton({ label, onConfirm, disabled }: { label: string; onConfirm: () => void; disabled?: boolean }) {
-  const [armed, setArmed] = useState(false);
+export interface MenuAction {
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  /** A destructive action needs a second click within 3 seconds. The menu stays open until then. */
+  confirm?: boolean;
+}
+
+/** A "⋯" button that opens a small menu. Closes on Esc, on a click outside and after an action; the arrow keys move between items. */
+export function MenuButton({ label, actions }: { label: string; actions: readonly MenuAction[] }) {
+  const [open, setOpen] = useState(false);
+  const [armed, setArmed] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+
+  const close = (refocus: boolean) => {
+    setOpen(false);
+    setArmed(null);
+    if (refocus) trigger.current?.focus();
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: PointerEvent) => {
+      if (!root.current?.contains(e.target as Node)) {
+        setOpen(false);
+        setArmed(null);
+      }
+    };
+    document.addEventListener("pointerdown", away);
+    return () => document.removeEventListener("pointerdown", away);
+  }, [open]);
+
   useEffect(() => {
     if (!armed) return;
-    const timer = setTimeout(() => setArmed(false), 3000);
+    const timer = setTimeout(() => setArmed(null), 3000);
     return () => clearTimeout(timer);
   }, [armed]);
 
+  const items = () => [...(root.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [])];
+
   return (
-    <button
-      className={`${quietCls} ${armed ? "border-signal text-signal" : ""}`}
-      disabled={disabled}
-      onClick={() => {
-        if (!armed) return setArmed(true);
-        setArmed(false);
-        onConfirm();
+    <div
+      ref={root}
+      className="relative"
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && open) {
+          e.stopPropagation(); // a dialog or page handler must not also react to this Esc
+          close(true);
+        } else if (open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+          e.preventDefault();
+          const list = items();
+          const at = list.indexOf(document.activeElement as HTMLButtonElement);
+          list[(at + (e.key === "ArrowDown" ? 1 : list.length - 1)) % list.length]?.focus();
+        }
       }}
     >
-      {armed ? "Sure?" : label}
-    </button>
+      <button
+        ref={trigger}
+        type="button"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`${quietCls} px-2 text-base leading-none`}
+        onClick={() => {
+          if (open) return close(false);
+          setOpen(true);
+          requestAnimationFrame(() => items()[0]?.focus());
+        }}
+      >
+        ⋯
+      </button>
+      {open && (
+        <div role="menu" aria-label={label} className="absolute top-full right-0 z-20 mt-1 min-w-36 rounded-md border border-line bg-white py-1 shadow-lg">
+          {actions.map((action) => {
+            const isArmed = armed === action.label;
+            return (
+              <button
+                key={action.label}
+                type="button"
+                role="menuitem"
+                disabled={action.disabled}
+                className={`block w-full cursor-pointer px-3 py-1.5 text-left text-xs hover:bg-paper focus-visible:bg-paper focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${
+                  action.confirm ? "text-signal" : ""
+                }`}
+                onClick={() => {
+                  if (action.confirm && !isArmed) return setArmed(action.label);
+                  close(true);
+                  action.onSelect();
+                }}
+              >
+                {isArmed ? "Sure?" : action.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 

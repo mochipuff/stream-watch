@@ -13,6 +13,8 @@ const LIVE_PAGE_MAX_CHARS = 1_500_000;
 const MAX_CANDIDATES = 15;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
+// YouTube allows Shorts up to 3 minutes. A video that is longer is a regular upload, whatever the page says.
+const SHORT_MAX_SECONDS = 180;
 const toUnix = (iso: string | undefined | null) => {
   if (!iso) return null;
   const sec = Math.floor(Date.parse(iso) / 1000);
@@ -233,6 +235,7 @@ const playerSchema = z.object({
       videoId: z.string().optional(),
       channelId: z.string().optional(),
       title: z.string().optional(),
+      lengthSeconds: z.string().optional(),
       isUpcoming: z.boolean().optional(),
       isLive: z.boolean().optional(),
     })
@@ -241,6 +244,9 @@ const playerSchema = z.object({
     .object({
       playerMicroformatRenderer: z
         .object({
+          isShortsEligible: z.boolean().optional(),
+          publishDate: z.string().optional(),
+          uploadDate: z.string().optional(),
           liveBroadcastDetails: z
             .object({
               isLiveNow: z.boolean().optional(),
@@ -257,7 +263,7 @@ const playerSchema = z.object({
 // A page without video details that still gives a final answer: removed, private, members-only, age-gated. Anything else is unreadable.
 const FINAL_UNPLAYABLE = new Set(["ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "AGE_VERIFICATION_REQUIRED", "CONTENT_CHECK_REQUIRED"]);
 
-/** A stream, or null for a plain video. Throws when the page cannot be trusted, so a bad answer is never remembered as "plain". */
+/** What a video is, or null for one that cannot be watched. Throws when the page cannot be trusted, so a bad answer is never remembered. */
 function classifyPlayer(html: string, videoId: string): Stream | null {
   const json = extractJson(html, PLAYER_MARKER);
   if (!json || typeof json !== "object") {
@@ -278,13 +284,20 @@ function classifyPlayer(html: string, videoId: string): Stream | null {
   }
   if (video.videoId && video.videoId !== videoId) return null;
 
-  const live = microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
-  // A stream that already ended is a plain video (VOD), whatever else the page says.
-  if (live?.endTimestamp) return null;
+  const format = microformat?.playerMicroformatRenderer;
+  const live = format?.liveBroadcastDetails;
+  const channelId = video.channelId;
+  const published = toUnix(format?.publishDate ?? format?.uploadDate) ?? toUnix(live?.startTimestamp);
+  const finished = (): Stream => {
+    const seconds = Number(video.lengthSeconds);
+    const short = format?.isShortsEligible === true && (!Number.isFinite(seconds) || seconds <= SHORT_MAX_SECONDS);
+    return { videoId, title: video.title || "Untitled video", status: short ? "short" : "vod", startAt: published, channelId };
+  };
+  // A stream that already ended is a VOD, whatever else the page says.
+  if (live?.endTimestamp) return { ...finished(), status: "vod" };
 
   const title = video.title || "Untitled stream";
   const startAt = toUnix(live?.startTimestamp);
-  const channelId = video.channelId;
 
   // An explicit `isLiveNow: false` wins over a leftover `isLive` flag.
   if (live?.isLiveNow ?? video.isLive) return { videoId, title, status: "live", startAt, channelId };
@@ -293,7 +306,7 @@ function classifyPlayer(html: string, videoId: string): Stream | null {
   // also exist on finished streams, so they only count while the start time is still ahead.
   const scheduled = Boolean(video.isUpcoming) || playabilityStatus?.status === "LIVE_STREAM_OFFLINE";
   const hinted = (Boolean(playabilityStatus?.liveStreamability) || startAt !== null) && (startAt === null || startAt > nowSec());
-  if (!scheduled && !hinted) return null;
+  if (!scheduled && !hinted) return finished();
 
   let upcomingAt = startAt;
   if (!upcomingAt) {

@@ -4,11 +4,12 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { z } from "zod";
-import { MAX_CHANNELS, MAX_MANUAL_VIDEOS, SOURCE_NAMES, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts";
-import type { StreamStatus } from "../shared/contract.ts";
+import { CONTENT_KINDS, KIND_LABEL, MAX_CHANNELS, MAX_MANUAL_VIDEOS, SOURCE_NAMES, VIDEO_ID_RE, schemas, uuid } from "../shared/contract.ts";
+import type { ContentKind } from "../shared/contract.ts";
 import { audit, readAudit } from "./audit.ts";
 import { errorMessage, guardRequest } from "./config.ts";
-import { parseRoleIds, query, setSetting, tx } from "./db.ts";
+import { parseKinds, parseRoleIds, query, setSetting, tx } from "./db.ts";
+import type { KindSettings } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
 import { configureProxy, proxyStatus } from "./http.ts";
@@ -71,11 +72,11 @@ function changed(c: Context, status: 200 | 201 | 202 = 200) {
 }
 
 const channelCount = query<{ n: number }>("SELECT COUNT(*) AS n FROM channels");
-const channelRow = query<{ handle: string; enabled: number }>("SELECT handle, enabled FROM channels WHERE id = ?");
+const channelRow = query<{ handle: string; enabled: number; kinds: string | null }>("SELECT handle, enabled, kinds FROM channels WHERE id = ?");
 const handleTaken = query("SELECT 1 FROM channels WHERE handle = ? COLLATE NOCASE");
 const insertChannel = query("INSERT INTO channels (id, handle) VALUES (?, ?)");
 const setChannelEnabled = query("UPDATE channels SET enabled = ? WHERE id = ?");
-const setChannelMessage = query("UPDATE channels SET message = ? WHERE id = ?");
+const setChannelKinds = query("UPDATE channels SET kinds = ? WHERE id = ?");
 const setChannelRoles = query("UPDATE channels SET role_ids = ? WHERE id = ?");
 const deleteChannel = query("DELETE FROM channels WHERE id = ?"); // links go with it (ON DELETE CASCADE)
 const manualCount = query<{ n: number }>("SELECT COUNT(*) AS n FROM manual_videos WHERE channel_id = ?");
@@ -95,20 +96,37 @@ const resendRow = query<{
   title: string;
   start_at: number | null;
   channel_name: string | null;
-  status: StreamStatus;
+  status: ContentKind;
   url: string;
   webhook_name: string;
   handle: string | null;
-  message: string | null;
+  kinds: string | null;
   role_ids: string | null;
 }>(
-  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle, c.message, c.role_ids
+  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle, c.kinds, c.role_ids
    FROM sent_streams s
    JOIN webhooks w ON w.id = s.webhook_id
    LEFT JOIN channels c ON c.id = s.channel_id
    WHERE s.webhook_id = ? AND s.video_id = ? AND s.delivered = 1`,
 );
 const touchSent = query("UPDATE sent_streams SET sent_at = ? WHERE webhook_id = ? AND video_id = ?");
+
+type KindsPatch = NonNullable<z.output<typeof schemas.channelPatch>["kinds"]>;
+
+/** Applies a patch to the stored settings. Switching a kind on stamps `since`, so only what is published from then on is announced. */
+function mergeKinds(current: KindSettings, patch: KindsPatch, nowSec: number): KindSettings {
+  const next = structuredClone(current);
+  for (const kind of CONTENT_KINDS) {
+    const change = patch[kind];
+    if (!change) continue;
+    if (change.enabled !== undefined) {
+      if (change.enabled && !next[kind].enabled) next[kind].since = nowSec;
+      next[kind].enabled = change.enabled;
+    }
+    if (change.message !== undefined) next[kind].message = change.message;
+  }
+  return next;
+}
 
 function setLinks(channelId: string, webhookIds: string[]) {
   clearLinks.run(channelId);
@@ -163,7 +181,7 @@ app.patch("/api/channels/:id", async (c) => {
     if (!current) throw HttpError(404, "Channel not found");
     if (body.enabled !== undefined) setChannelEnabled.run(body.enabled ? 1 : 0, id);
     if (body.webhookIds) setLinks(id, body.webhookIds);
-    if (body.message !== undefined) setChannelMessage.run(body.message, id);
+    if (body.kinds) setChannelKinds.run(JSON.stringify(mergeKinds(parseKinds(current.kinds), body.kinds, Math.floor(Date.now() / 1000))), id);
     if (body.roleIds) setChannelRoles.run(body.roleIds.join(","), id);
     return current;
   });
@@ -171,7 +189,11 @@ app.patch("/api/channels/:id", async (c) => {
     audit("info", body.enabled ? "channel.resumed" : "channel.paused", `${body.enabled ? "Resumed" : "Paused"} ${row.handle}`);
   }
   if (body.webhookIds) audit("info", "channel.webhooks", `${row.handle} now sends to ${body.webhookIds.length} webhook(s)`);
-  if (body.message !== undefined || body.roleIds) audit("info", "channel.message", `Updated the message settings of ${row.handle}`);
+  if (body.kinds) {
+    const names = CONTENT_KINDS.filter((kind) => body.kinds?.[kind]).map((kind) => KIND_LABEL[kind]);
+    audit("info", "channel.message", `Updated the ${names.join(", ")} settings of ${row.handle}`);
+  }
+  if (body.roleIds) audit("info", "channel.roles", `Updated the mentioned roles of ${row.handle}`);
   return changed(c);
 });
 
@@ -290,7 +312,7 @@ app.post("/api/sent/:webhookId/:videoId/resend", async (c) => {
         handle: row.handle,
         video: { videoId, title: row.title, status: row.status, startAt: row.start_at },
         thumbnail: await thumbnailFor(videoId),
-        message: row.message,
+        message: parseKinds(row.kinds)[row.status].message,
         roleIds: parseRoleIds(row.role_ids),
       }),
     );

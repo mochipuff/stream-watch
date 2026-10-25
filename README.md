@@ -1,6 +1,6 @@
 # Stream Watch
 
-Checks YouTube channels for upcoming and live streams and posts them to Discord webhooks (embed + "Watch on YouTube" button). Each video is sent once per webhook. Messages use the webhook's own name and avatar from Discord; the name typed in the dashboard is only a label. Thumbnails are `i.ytimg.com` `maxresdefault` URLs that Discord loads itself (falls back to `hqdefault` when YouTube has no max-res image). Streams listed under "Recently sent" can be sent again to the same webhook. A stream is announced once per webhook, whether it was first seen as upcoming or already live.
+Checks YouTube channels for upcoming and live streams (and, when switched on per channel, new VODs and Shorts) and posts them to Discord webhooks (embed + "Watch on YouTube" button). Each video is sent once per webhook. Messages use the webhook's own name and avatar from Discord; the name typed in the dashboard is only a label. Thumbnails are `i.ytimg.com` `maxresdefault` URLs that Discord loads itself (falls back to `hqdefault` when YouTube has no max-res image). Streams listed under "Recently sent" can be sent again to the same webhook. A stream is announced once per webhook, whether it was first seen as upcoming or already live.
 
 It is built to run on your own machine in dev mode: TypeScript everywhere, no build step, no paid server.
 
@@ -29,7 +29,9 @@ A check has two steps: **discovery** (which videos of the channel might be live 
 
 **One failing source never fails the check while another answers.** Each source has a breaker: after 3 failures in a row (or at once on HTTP 429, a consent page or a bot check) it rests for 30s, 60s, 2m … up to 10m, and the dashboard shows the countdown. A manual check goes around the rest period. Being offline (DNS or connection errors) never pauses a source.
 
-**Classification** reads each candidate's own watch page and decides `live`, `upcoming` or plain; a stream with an end time is always plain, so an old VOD is never announced as live. A bot-check or sign-in page is an error and is never remembered as a plain video. Plain videos are remembered in the database and never loaded again; live and upcoming ones are re-read every 5 minutes. If watch pages cannot be read, the API classifies them.
+**Classification** reads each candidate's own watch page and decides `live`, `upcoming`, `short` or `vod`; a stream with an end time is always a `vod`, so an old stream is never announced as live. A bot-check or sign-in page is an error and is never remembered. A `vod` or `short` never changes into anything else, so it is remembered in the database (with its title and publish time) and its page is never loaded again; live and upcoming ones are re-read every 5 minutes. If watch pages cannot be read, the API classifies them.
+
+A Short is a video that YouTube marks as Shorts-eligible and that is at most 3 minutes long (the API fallback has no such flag and uses "at most 60 seconds"). A `vod` is every other finished video: a regular upload, or the replay of a stream. VODs and Shorts are found through the RSS feed (or the API), which list recent uploads; page scraping only looks at the streams tab, so with RSS and the API both down only streams are found.
 
 **Videos added by hand**: the "Videos" button on a channel takes a watch, live, shorts or youtu.be link (up to 10 per channel). Those videos are checked with the channel whatever the three sources do, so they still work while everything else fails. A video of another channel is refused, and one that is no longer live or upcoming (or older than 14 days) is removed. With all three sources off, only these videos are checked.
 
@@ -39,9 +41,14 @@ The dashboard shows which source answered for each channel. The channel id (UC�
 
 **Automatic cycle and manual check**: automatic checks can be turned off. "Check now" (and "Check" on one channel) works either way, ignores the failure back-off, and still never sends the same stream to the same webhook twice. Manual checks are limited to one every 5 seconds.
 
-**Message per channel**: the "Message" button on a channel sets text that is sent above the embed for that handle only. `{user}` becomes the handle (for example `@MizuHamzazu`) and `@{roleid}` becomes a mention of every role id saved for that handle (up to 10, each 17 to 20 digits). Example: `@{roleid} {user} is live!`. Only the saved roles can ping, and only when the message contains `@{roleid}`; `@everyone`, `@here` and other role ids typed by hand never notify anyone. Messages are up to 1000 characters; an empty message sends the embed alone. Existing databases get the two new columns automatically on start.
+**Messages per channel and kind**: the "Messages" button on a channel has one tab for each kind (Upcoming, Live, VOD, Shorts). Every kind has its own on/off switch and its own text, sent above the embed for that handle only. `{user}` becomes the handle (for example `@MizuHamzazu`) and `@{roleid}` becomes a mention of every role id saved for that handle (up to 10, each 17 to 20 digits, shared by all kinds). Example: `@{roleid} {user} is live!`. Only the saved roles can ping, and only when the message contains `@{roleid}`; `@everyone`, `@here` and other role ids typed by hand never notify anyone. Messages are up to 1000 characters; an empty message sends the embed alone.
+- Upcoming and Live are on by default, as before. **VOD and Shorts are off by default** and are announced only if they were published after the moment the kind was switched on, so switching it on never replays a channel's back catalogue.
+- A video is still sent once per webhook. A stream that was announced as upcoming or live is not announced again as a VOD when it ends.
+- A message that existed before this version becomes the Upcoming and Live message of that channel.
 
-**Channel list**: search by handle or name, filter by All / Active / Paused / Error, 10 per page. At most 500 channels.
+**Channel list**: search by handle or name, filter by All / Active / Paused / Error, 10 per page. At most 500 channels. The "⋯" button on a channel (Check now, Pause or Resume, Remove) and on a webhook (Send test, Pause or Resume, Remove) opens a menu; Remove asks for a second click.
+
+**Dev proxy log**: Vite proxies the dashboard's WebSocket to the API. Closing or reloading a tab, or the API restarting under `node --watch`, resets that socket (`ECONNRESET` or `EPIPE`). Both are normal and hidden; any other proxy error (such as the API being down) is still printed.
 
 **Activity log**: changes, checks, sends, source and proxy fallbacks, and errors. Each level (info, warning, error) keeps only its newest 15 entries, so an error is never pushed out by a burst of info lines. Older entries are deleted automatically, including on the first start after this limit was introduced. Webhook tokens, proxy passwords and API keys are removed before anything is written.
 

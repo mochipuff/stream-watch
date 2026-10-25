@@ -3,7 +3,8 @@ import { MAX_INTERVAL_MS, MIN_INTERVAL_MS, VIDEO_ID_RE } from "../shared/contrac
 import type { CheckSource, CheckSummary } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
-import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
+import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
+import type { KindSettings } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
 import { SOURCE_LABEL } from "./sources.ts";
@@ -23,7 +24,7 @@ interface Channel {
   name: string | null;
   source: CheckSource | null;
   error: string | null;
-  message: string | null;
+  kinds: string | null;
   role_ids: string;
 }
 
@@ -62,7 +63,7 @@ export function forget(id: string) {
 }
 
 const enabledHooks = query<Hook>("SELECT id, name, url, error FROM webhooks WHERE enabled = 1");
-const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, message, role_ids FROM channels WHERE enabled = 1 ORDER BY rowid");
+const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, kinds, role_ids FROM channels WHERE enabled = 1 ORDER BY rowid");
 const allLinks = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const handleOf = query<{ handle: string }>("SELECT handle FROM channels WHERE id = ?");
 const manualOf = query<{ video_id: string }>("SELECT video_id FROM manual_videos WHERE channel_id = ? ORDER BY added_at");
@@ -90,21 +91,31 @@ const markChecked = query(
 );
 const markFailed = query("UPDATE channels SET checked_at = ?, error = ? WHERE id = ?");
 
-async function deliver(hook: Hook, channel: Channel, channelName: string, stream: Stream, force: boolean): Promise<boolean> {
+const isStream = (stream: Stream) => stream.status === "live" || stream.status === "upcoming";
+
+/** Whether a stream or video is announced for this channel. A VOD or Short must be newer than the moment its kind was switched on. */
+function wanted(stream: Stream, kinds: KindSettings): boolean {
+  const kind = kinds[stream.status];
+  if (!kind.enabled) return false;
+  return isStream(stream) || (kind.since > 0 && stream.startAt !== null && stream.startAt >= kind.since);
+}
+
+async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channelName: string, stream: Stream, force: boolean): Promise<boolean> {
   const key = `hook:${hook.id}`;
   if (!force && blocked(key)) return false;
   const sentAt = nowSec();
   const claimed =
     Number(claim.run(hook.id, stream.videoId, channel.id, stream.title, stream.startAt, sentAt, channelName, stream.status).changes) === 1;
   if (!claimed) {
-    refresh.run(stream.title, stream.startAt, channelName, stream.status, hook.id, stream.videoId, stream.title, stream.startAt, channelName, stream.status);
+    // Only a stream changes (new title, new start time, live now). A VOD or Short is final, and a stream that has become a VOD keeps what it was announced as.
+    if (isStream(stream)) refresh.run(stream.title, stream.startAt, channelName, stream.status, hook.id, stream.videoId, stream.title, stream.startAt, channelName, stream.status);
     return false;
   }
   try {
     const thumbnail = await thumbnailFor(stream.videoId);
     await postWebhook(
       hook.url,
-      buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: channel.message, roleIds: parseRoleIds(channel.role_ids) }),
+      buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: kinds[stream.status].message, roleIds: parseRoleIds(channel.role_ids) }),
     );
   } catch (err) {
     release.run(hook.id, stream.videoId); // failed send must be retried later
@@ -124,7 +135,7 @@ async function deliver(hook: Hook, channel: Channel, channelName: string, stream
     setHookError.run(null, hook.id);
     audit("info", "webhook.recovered", `${hook.name} is working again`);
   }
-  audit("info", "stream.sent", `"${stream.title}" (${channel.handle}) sent to ${hook.name}${stream.status === "live" ? " while live" : ""}`);
+  audit("info", "stream.sent", `"${stream.title}" (${channel.handle}) sent to ${hook.name} (${stream.status})`);
   events.emit("stream_sent", {
     title: stream.title,
     videoId: stream.videoId,
@@ -187,8 +198,10 @@ async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Pr
     }
 
     let sent = 0;
+    const kinds = parseKinds(channel.kinds);
     for (const stream of streams) {
-      for (const hook of hooks) if (await deliver(hook, channel, found.channelName, stream, force)) sent++;
+      if (!wanted(stream, kinds)) continue;
+      for (const hook of hooks) if (await deliver(hook, channel, kinds, found.channelName, stream, force)) sent++;
     }
     return { sent, failed: found.error !== null };
   } catch (err) {

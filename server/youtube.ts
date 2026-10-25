@@ -1,4 +1,4 @@
-import type { CheckSource, SourceName, StreamStatus } from "../shared/contract.ts";
+import type { CheckSource, ContentKind, SourceName } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
 import { query } from "./db.ts";
@@ -11,8 +11,8 @@ import type { Scraped } from "./yt-pages.ts";
 export interface Stream {
   videoId: string;
   title: string;
-  status: StreamStatus;
-  startAt: number | null; // unix seconds
+  status: ContentKind;
+  startAt: number | null; // unix seconds: when a stream starts, or when a VOD or Short was published
   channelId?: string | undefined; // the channel that owns the video, when the source says
 }
 
@@ -42,7 +42,8 @@ export interface Lookup {
 //  1. Discovery asks sources for candidate video ids, cheapest first: the RSS feed, then the channel's own pages, and only when
 //     both fail the API. Every source has a breaker (sources.ts), so a failing one is skipped for a while instead of being
 //     hit on every cycle, and one failing source never fails the check while another answers.
-//  2. Classification reads each candidate's watch page (or, if pages cannot be read, the API) and decides live / upcoming / plain.
+//  2. Classification reads each candidate's watch page (or, if pages cannot be read, the API) and decides live / upcoming / short / vod.
+//     null is only for a video nobody can watch (removed, private) or one that belongs to someone else.
 //  3. Manual videos are always added to the candidates, so they still work when every automatic source is down.
 
 const MAX_FEED_BYTES = 512 * 1024;
@@ -57,18 +58,23 @@ const PARTIAL_WARN_EVERY_MS = 3_600_000;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-// Plain videos are cached so we never re-classify normal uploads.
-const findPlain = query("SELECT 1 FROM plain_videos WHERE video_id = ?");
-const savePlain = query("INSERT OR REPLACE INTO plain_videos (video_id, checked_at) VALUES (?, ?)");
+// A video that is neither live nor upcoming never changes into one, so it is read once. The row also keeps what a Short or VOD
+// announcement needs (title, publish time, owner), so a restart does not read the page again.
+const findPlain = query<{ kind: ContentKind | null; title: string | null; published_at: number | null; channel_id: string | null }>(
+  "SELECT kind, title, published_at, channel_id FROM plain_videos WHERE video_id = ?",
+);
+const savePlain = query(
+  "INSERT OR REPLACE INTO plain_videos (video_id, checked_at, kind, title, published_at, channel_id) VALUES (?, ?, ?, ?, ?, ?)",
+);
 const deletePlain = query("DELETE FROM plain_videos WHERE video_id = ?");
 query("DELETE FROM plain_videos WHERE checked_at < ?").run(nowSec() - PLAIN_TTL_SEC);
 
 const streamMemo = new Map<string, { stream: Stream; until: number }>();
 
 function remember(videoId: string, stream: Stream | null) {
-  if (!stream) {
+  if (!stream || stream.status === "vod" || stream.status === "short") {
     streamMemo.delete(videoId);
-    savePlain.run(videoId, nowSec());
+    savePlain.run(videoId, nowSec(), stream?.status ?? null, stream?.title ?? null, stream?.startAt ?? null, stream?.channelId ?? null);
     return;
   }
   // Unblock in case it was previously misclassified as a plain video
@@ -78,7 +84,14 @@ function remember(videoId: string, stream: Stream | null) {
 }
 
 function cached(videoId: string): { known: true; stream: Stream | null } | { known: false } {
-  if (findPlain.get(videoId)) return { known: true, stream: null };
+  const plain = findPlain.get(videoId);
+  if (plain) {
+    const { kind, title } = plain;
+    // A row from before VODs and Shorts were announced has no kind: it stays a video that is never announced.
+    const stream: Stream | null =
+      kind && title ? { videoId, title, status: kind, startAt: plain.published_at, channelId: plain.channel_id ?? undefined } : null;
+    return { known: true, stream };
+  }
   const memo = streamMemo.get(videoId);
   return memo && memo.until > Date.now() ? { known: true, stream: memo.stream } : { known: false };
 }
@@ -296,9 +309,10 @@ export async function lookupStreams(channel: ChannelRef, { force, manualIds }: L
     const verdict = verdicts.get(id);
     if (verdict === undefined) continue; // could not be read this time
     const byHand = manualIds.includes(id);
-    if (verdict === null) {
-      if (byHand) manual.ended.push(id);
-    } else if (byHand && verdict.channelId && verdict.channelId !== channelId) {
+    // A video added by hand stays only while it is live or upcoming. Once it is a VOD it is done with, like before.
+    if (byHand && (verdict === null || (verdict.status !== "live" && verdict.status !== "upcoming"))) manual.ended.push(id);
+    if (verdict === null) continue;
+    if (byHand && verdict.channelId && verdict.channelId !== channelId) {
       manual.foreign.push(id); // announcing another channel's video under this handle would mislead
     } else {
       streams.push(verdict);

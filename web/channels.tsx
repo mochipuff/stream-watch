@@ -1,8 +1,8 @@
 import { memo, useDeferredValue, useMemo, useState } from "react";
-import { MAX_MANUAL_VIDEOS, MAX_MESSAGE_LENGTH } from "../shared/contract.ts";
-import type { ChannelDto, WebhookDto } from "../shared/contract.ts";
+import { CONTENT_KINDS, KIND_LABEL, MAX_MANUAL_VIDEOS, MAX_MESSAGE_LENGTH } from "../shared/contract.ts";
+import type { ChannelDto, ContentKind, WebhookDto } from "../shared/contract.ts";
 import { api, useAction } from "./api.ts";
-import { ChipGroup, ConfirmButton, Dialog, RelativeTime, Row, Section, buttonCls, inputCls, quietCls } from "./ui.tsx";
+import { ChipGroup, Dialog, MenuButton, RelativeTime, Row, Section, buttonCls, inputCls, quietCls } from "./ui.tsx";
 
 const PAGE_SIZE = 10;
 
@@ -115,21 +115,47 @@ function ChannelWebhooksDialog({ channel, webhooks, onClose }: { channel: Channe
   );
 }
 
+const KIND_HINT: Record<ContentKind, string> = {
+  upcoming: "A scheduled stream or premiere.",
+  live: "A stream that is running now.",
+  vod: "A regular upload, or the replay of a finished stream that was not announced before. Only videos published after you switch this on are sent.",
+  short: "A YouTube Short. Only Shorts published after you switch this on are sent.",
+};
+
 function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClose: () => void }) {
-  const [message, setMessage] = useState(channel.message ?? "");
+  const [drafts, setDrafts] = useState(() => Object.fromEntries(CONTENT_KINDS.map((k) => [k, { enabled: channel.kinds[k].enabled, message: channel.kinds[k].message ?? "" }])) as Record<ContentKind, { enabled: boolean; message: string }>);
+  const [kind, setKind] = useState<ContentKind>("upcoming");
   const [roles, setRoles] = useState(channel.roleIds.join("\n"));
+  const draft = drafts[kind];
+  const change = (next: Partial<typeof draft>) => setDrafts((all) => ({ ...all, [kind]: { ...all[kind], ...next } }));
   const save = useAction(() =>
-    api.patchChannel(channel.id, { message: message.trim() || null, roleIds: roles.split(/[\s,]+/).filter(Boolean) }),
+    api.patchChannel(channel.id, {
+      kinds: Object.fromEntries(CONTENT_KINDS.map((k) => [k, { enabled: drafts[k].enabled, message: drafts[k].message.trim() || null }])),
+      roleIds: roles.split(/[\s,]+/).filter(Boolean),
+    }),
   );
 
   return (
     <Dialog
-      title={`Message for ${channel.handle}`}
-      hint="Sent above the embed. {user} becomes the handle, @{roleid} mentions every role below. Leave empty to send the embed only."
+      title={`Messages for ${channel.handle}`}
+      hint="Sent above the embed. {user} becomes the handle, @{roleid} mentions every role below. Leave a message empty to send the embed only."
       onClose={onClose}
     >
-      <label className="mt-4 block text-xs font-semibold text-muted" htmlFor="channel-message">
-        Message
+      <div className="mt-4">
+        <ChipGroup
+          label="Kind of video"
+          value={kind}
+          onChange={setKind}
+          options={CONTENT_KINDS.map((k) => ({ value: k, label: `${KIND_LABEL[k]}${drafts[k].enabled ? " ✓" : ""}` }))}
+        />
+      </div>
+      <label className="mt-3 flex items-center gap-2 text-xs font-semibold">
+        <input type="checkbox" checked={draft.enabled} onChange={(e) => change({ enabled: e.target.checked })} />
+        Announce {KIND_LABEL[kind]}
+      </label>
+      <p className="mt-1 text-xs text-muted">{KIND_HINT[kind]}</p>
+      <label className="mt-3 block text-xs font-semibold text-muted" htmlFor="channel-message">
+        {KIND_LABEL[kind]} message
       </label>
       <textarea
         id="channel-message"
@@ -137,11 +163,11 @@ function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClo
         rows={4}
         maxLength={MAX_MESSAGE_LENGTH}
         placeholder="@{roleid} {user} is streaming!"
-        value={message}
-        onChange={(e) => setMessage(e.target.value)}
+        value={draft.message}
+        onChange={(e) => change({ message: e.target.value })}
       />
       <label className="mt-3 block text-xs font-semibold text-muted" htmlFor="channel-roles">
-        Role IDs to mention (one per line)
+        Role IDs to mention (one per line, shared by all kinds)
       </label>
       <textarea
         id="channel-roles"
@@ -256,7 +282,7 @@ const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkB
             onClick={() => onMessage(channel.id)}
             className="shrink-0 cursor-pointer rounded border border-line bg-paper px-2 py-0.5 text-[11px] font-normal text-muted hover:text-ink"
           >
-            {channel.message ? "Message ✓" : "Message"}
+            {CONTENT_KINDS.some((k) => channel.kinds[k].message) ? "Messages ✓" : "Messages"}
           </button>
           <button
             onClick={() => onVideos(channel.id)}
@@ -282,15 +308,14 @@ const ChannelRow = memo(function ChannelRow({ channel, activeHooks, busy, checkB
         )
       }
     >
-      {channel.enabled && (
-        <button className={quietCls} disabled={busy || checkBlocked} onClick={() => onCheck(channel.id)}>
-          Check
-        </button>
-      )}
-      <button className={quietCls} disabled={busy} onClick={() => onToggle({ id: channel.id, enabled: !channel.enabled })}>
-        {channel.enabled ? "Pause" : "Resume"}
-      </button>
-      <ConfirmButton label="Remove" disabled={busy} onConfirm={() => onRemove(channel.id)} />
+      <MenuButton
+        label={`Actions for ${channel.handle}`}
+        actions={[
+          ...(channel.enabled ? [{ label: "Check now", disabled: busy || checkBlocked, onSelect: () => onCheck(channel.id) }] : []),
+          { label: channel.enabled ? "Pause" : "Resume", disabled: busy, onSelect: () => onToggle({ id: channel.id, enabled: !channel.enabled }) },
+          { label: "Remove", disabled: busy, confirm: true, onSelect: () => onRemove(channel.id) },
+        ]}
+      />
     </Row>
   );
 });

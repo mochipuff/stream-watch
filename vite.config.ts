@@ -2,13 +2,15 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { createLogger, defineConfig, loadEnv } from "vite";
 
-// Closing or reloading a tab resets the proxied WebSocket (ECONNRESET). That is normal, so Vite must not
-// print it as an error. Every other proxy error (for example the API being down) is still logged.
+// Closing or reloading a tab, or the API restarting (node --watch), resets the proxied WebSocket: ECONNRESET when the
+// read side breaks, EPIPE when Vite writes into a socket the other side has already closed. Both are normal, so Vite must
+// not print them as errors. Every other proxy error (for example the API being down) is still logged.
+const BENIGN_SOCKET_CODES = new Set(["ECONNRESET", "EPIPE"]);
 const logger = createLogger();
 const logError = logger.error;
 logger.error = (msg, options) => {
   const code = (options?.error as NodeJS.ErrnoException | null | undefined)?.code;
-  if (code === "ECONNRESET" && /ws proxy (socket )?error/.test(msg)) return;
+  if (code && BENIGN_SOCKET_CODES.has(code) && /ws proxy (socket )?error/.test(msg)) return;
   logError(msg, options);
 };
 

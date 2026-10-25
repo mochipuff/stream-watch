@@ -32,7 +32,8 @@ const videosSchema = z.object({
     .array(
       z.object({
         id: z.string(),
-        snippet: z.object({ title: z.string(), channelId: z.string().optional(), liveBroadcastContent: z.string() }),
+        snippet: z.object({ title: z.string(), channelId: z.string().optional(), liveBroadcastContent: z.string(), publishedAt: z.string().optional() }),
+        contentDetails: z.object({ duration: z.string().optional() }).optional(),
         liveStreamingDetails: z.object({ scheduledStartTime: z.string().optional(), actualStartTime: z.string().optional() }).optional(),
       }),
     )
@@ -43,6 +44,15 @@ const toUnix = (iso: string | undefined) => {
   const sec = iso ? Math.floor(Date.parse(iso) / 1000) : NaN;
   return Number.isFinite(sec) && sec > 0 ? sec : null;
 };
+
+// ISO 8601 duration such as PT45S or PT1H2M3S. Null when it cannot be read.
+function durationSeconds(iso: string | undefined): number | null {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso ?? "");
+  return m ? Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0) : null;
+}
+
+// The API does not say whether a video is a Short. Up to a minute is the classic definition; anything longer counts as a VOD here.
+const API_SHORT_MAX_SECONDS = 60;
 
 function apiReason(body: string): string {
   try {
@@ -95,21 +105,32 @@ export async function discoverByApi(channelId: string): Promise<string[]> {
   return [...new Set([...live, ...uploads])];
 }
 
-/** One unit per 50 videos. A video missing from the answer (deleted, private) is a plain video. */
+/** One unit per 50 videos. A video missing from the answer (deleted, private) has no verdict worth announcing. */
 export async function classifyByApi(videoIds: readonly string[]): Promise<Map<string, Stream | null>> {
   const verdicts = new Map<string, Stream | null>();
   for (let i = 0; i < videoIds.length; i += MAX_IDS_PER_CALL) {
     const chunk = videoIds.slice(i, i + MAX_IDS_PER_CALL);
-    const { items } = await apiGet("videos", { part: "snippet,liveStreamingDetails", id: chunk.join(",") }, videosSchema);
+    const { items } = await apiGet("videos", { part: "snippet,contentDetails,liveStreamingDetails", id: chunk.join(",") }, videosSchema);
     const byId = new Map(items.map((item) => [item.id, item]));
     for (const id of chunk) {
       const item = byId.get(id);
       const status = item?.snippet.liveBroadcastContent;
-      if (!item || (status !== "live" && status !== "upcoming")) {
-        verdicts.set(id, null);
+      if (!item) {
+        verdicts.set(id, null); // deleted or private
         continue;
       }
       const details = item.liveStreamingDetails;
+      if (status !== "live" && status !== "upcoming") {
+        const seconds = durationSeconds(item.contentDetails?.duration);
+        verdicts.set(id, {
+          videoId: id,
+          title: item.snippet.title || "Untitled video",
+          status: seconds !== null && seconds <= API_SHORT_MAX_SECONDS && !details ? "short" : "vod",
+          startAt: toUnix(item.snippet.publishedAt),
+          channelId: item.snippet.channelId,
+        });
+        continue;
+      }
       verdicts.set(id, {
         videoId: id,
         title: item.snippet.title || "Untitled stream",

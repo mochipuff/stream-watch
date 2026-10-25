@@ -1,13 +1,13 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { WEBHOOK_RE } from "../shared/contract.ts";
-import type { StreamStatus } from "../shared/contract.ts";
+import type { ContentKind } from "../shared/contract.ts";
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 interface PayloadInput {
   channelName: string;
   handle: string | null;
-  video: { videoId: string; title: string; status: StreamStatus; startAt: number | null };
+  video: { videoId: string; title: string; status: ContentKind; startAt: number | null };
   thumbnail: string;
   message?: string | null;
   roleIds?: readonly string[];
@@ -27,16 +27,24 @@ function renderMessage(template: string | null | undefined, handle: string | nul
   return { content: clip(text.trim(), 2000) || undefined, roles: ROLE_TOKEN_RE.test(template) ? [...roleIds] : [] };
 }
 
+const FOOTER: Record<ContentKind, string> = { upcoming: "Upcoming stream", live: "Live stream", vod: "Video", short: "Short" };
+
+function describe({ status, startAt }: PayloadInput["video"]): string | undefined {
+  switch (status) {
+    case "live":
+      return "Live now";
+    case "upcoming":
+      return startAt ? `Starts <t:${startAt}:F> (<t:${startAt}:R>)` : "Start time not announced yet";
+    default:
+      return startAt ? `Published <t:${startAt}:R>` : undefined;
+  }
+}
+
 // No `username` on purpose: Discord shows the webhook's own default name and avatar.
 export function buildPayload({ channelName, handle, video, thumbnail, message, roleIds = [] }: PayloadInput) {
   const { content, roles } = renderMessage(message, handle, roleIds);
-  const url = `https://www.youtube.com/watch?v=${video.videoId}`;
-  const live = video.status === "live";
-  const description = live
-    ? "Live now"
-    : video.startAt
-      ? `Starts <t:${video.startAt}:F> (<t:${video.startAt}:R>)`
-      : "Start time not announced yet";
+  const url = `https://www.youtube.com/${video.status === "short" ? "shorts/" : "watch?v="}${video.videoId}`;
+  const description = describe(video);
   return {
     ...(content ? { content } : {}),
     allowed_mentions: { parse: [], roles },
@@ -44,11 +52,11 @@ export function buildPayload({ channelName, handle, video, thumbnail, message, r
       {
         title: clip(video.title, 256),
         url,
-        description,
+        ...(description ? { description } : {}),
         color: 0xd92d4a,
         author: { name: clip(channelName, 256), ...(handle ? { url: `https://www.youtube.com/${handle}` } : {}) },
         image: { url: thumbnail }, // Discord loads it from YouTube's CDN; this server never downloads it
-        footer: { text: live ? "Live stream" : "Upcoming stream" },
+        footer: { text: FOOTER[video.status] },
       },
     ],
     components: [{ type: 1, components: [{ type: 2, style: 5, label: "Watch on YouTube", url }] }],

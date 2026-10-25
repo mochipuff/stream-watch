@@ -1,5 +1,6 @@
-import type { CheckSource, CycleDto, Overview, StreamStatus } from "../shared/contract.ts";
-import { getIntervalMs, isAutoEnabled, parseRoleIds, query } from "./db.ts";
+import { CONTENT_KINDS } from "../shared/contract.ts";
+import type { ChannelDto, CheckSource, ContentKind, CycleDto, Overview } from "../shared/contract.ts";
+import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
 import { proxyStatus } from "./http.ts";
 import { state } from "./poller.ts";
 import { sourceStates } from "./sources.ts";
@@ -14,9 +15,9 @@ const channelRows = query<{
   live_count: number;
   source: CheckSource | null;
   error: string | null;
-  message: string | null;
+  kinds: string | null;
   role_ids: string;
-}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, message, role_ids FROM channels ORDER BY rowid");
+}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, kinds, role_ids FROM channels ORDER BY rowid");
 const linkRows = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const manualRows = query<{ channel_id: string; video_id: string; added_at: number }>(
   "SELECT channel_id, video_id, added_at FROM manual_videos ORDER BY added_at",
@@ -30,7 +31,7 @@ const recentRows = query<{
   title: string;
   start_at: number | null;
   sent_at: number;
-  status: StreamStatus;
+  status: ContentKind;
   webhook_name: string | null;
   handle: string | null;
 }>(
@@ -46,6 +47,12 @@ const previewOf = (url: string) => {
   const id = /\/webhooks\/(\d+)\//.exec(url)?.[1];
   return id ? `…/webhooks/${id}/••••••••` : "Discord webhook"; // never expose any part of the secret token
 };
+
+// `since` stays on the server: the dashboard only needs the switch and the text.
+function kindsDto(raw: string | null): ChannelDto["kinds"] {
+  const kinds = parseKinds(raw);
+  return Object.fromEntries(CONTENT_KINDS.map((kind) => [kind, { enabled: kinds[kind].enabled, message: kinds[kind].message }])) as ChannelDto["kinds"];
+}
 
 let rev = 0;
 
@@ -79,7 +86,7 @@ export function overview(): Overview {
       source: c.source,
       error: c.error,
       webhookIds: (links[c.id] ?? []).map((l) => l.webhook_id),
-      message: c.message,
+      kinds: kindsDto(c.kinds),
       roleIds: parseRoleIds(c.role_ids),
       manualVideos: (manual[c.id] ?? []).map((v) => ({ videoId: v.video_id, addedAt: v.added_at })),
     })),
