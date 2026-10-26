@@ -173,7 +173,7 @@ function candidatesFromHtml(html: string): string[] {
 }
 
 /** `/live` answers with the watch page of the channel's latest stream only while one is running, or with the channel page. Either way the watch page decides. */
-async function liveNowId(channelId: string): Promise<string | null> {
+export async function liveNowId(channelId: string): Promise<string | null> {
   const html = await getHtml(`https://www.youtube.com/channel/${channelId}/live?hl=en`, (h) => h.includes("</head>"), LIVE_PAGE_MAX_CHARS);
   return /<link[^>]+rel="canonical"[^>]+href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})/.exec(html)?.[1] ?? null;
 }

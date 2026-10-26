@@ -1,6 +1,8 @@
 import { setTimeout as sleep } from "node:timers/promises";
+import { fetch } from "undici";
 import { WEBHOOK_RE } from "../shared/contract.ts";
 import type { ContentKind } from "../shared/contract.ts";
+import { directAgent } from "./http.ts";
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
@@ -72,7 +74,8 @@ export async function postWebhook(webhookUrl: string, payload: ReturnType<typeof
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "error",
-      signal: AbortSignal.timeout(10_000),
+      dispatcher: directAgent(),
+      signal: AbortSignal.timeout(7_000),
     });
     if (res.ok) return;
     if (res.status === 429) {

@@ -1,6 +1,7 @@
 import { CONTENT_KINDS } from "../shared/contract.ts";
 import type { ChannelDto, CheckSource, ContentKind, CycleDto, Overview } from "../shared/contract.ts";
 import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
+import { isOnline } from "./connectivity.ts";
 import { proxyStatus } from "./http.ts";
 import { state } from "./poller.ts";
 import { sourceStates } from "./sources.ts";
@@ -62,6 +63,7 @@ export function cycle(): CycleDto {
     auto,
     running: state.running,
     intervalMs: getIntervalMs(),
+    online: isOnline(),
     lastCycleAt: state.lastCycleAt,
     nextCycleAt: auto ? state.nextCycleAt : null,
   };

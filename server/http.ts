@@ -1,12 +1,16 @@
 import { socksDispatcher } from "fetch-socks";
-import { ProxyAgent, fetch, type Dispatcher } from "undici";
+import { Agent, ProxyAgent, fetch, type Dispatcher } from "undici";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
+import { isOnline, reportNetworkFailure, setProbe } from "./connectivity.ts";
 import { getSetting, setSetting } from "./db.ts";
+import { events } from "./events.ts";
 
 const PROXY_KEY = "proxyUrl";
 const PROXY_COOLDOWN_MS = 60_000;
-const PROXY_ATTEMPT_MS = 6_000;
+const PROXY_ATTEMPT_MS = 3_000;
+const CONNECT_TIMEOUT_MS = 4_000;
+const PROBE_URL = "https://www.youtube.com/generate_204";
 const DEFAULT_SOCKS_PORT = 1080;
 
 interface Proxy {
@@ -17,6 +21,12 @@ interface Proxy {
 }
 
 let proxy: Proxy | null = null;
+
+const makeAgent = () => new Agent({ connect: { timeout: CONNECT_TIMEOUT_MS }, keepAliveTimeout: 4_000 });
+let direct = makeAgent();
+
+/** The agent for direct requests (also used for Discord). It is replaced after an outage, so no dead keep-alive socket is reused. */
+export const directAgent = () => direct;
 
 function buildDispatcher(url: string): Dispatcher {
   const u = new URL(url);
@@ -63,6 +73,8 @@ export interface YtRequest {
   headers?: Record<string, string>;
   redirect?: "follow" | "error";
   timeoutMs: number;
+  /** Only for the connectivity probe: it must run while the server believes it is offline. */
+  probe?: boolean;
 }
 
 /**
@@ -70,7 +82,8 @@ export interface YtRequest {
  * the same request is retried directly ("none") and the proxy is skipped for a cool-down so a dead proxy does not
  * slow down every request. A failed direct request is a real error and is thrown.
  */
-export async function ytFetch(url: string, { timeoutMs, ...init }: YtRequest) {
+export async function ytFetch(url: string, { timeoutMs, probe = false, ...init }: YtRequest) {
+  if (!probe && !isOnline()) throw new OfflineError(); // fail at once: no request can work, and no timeout has to run out
   const route = proxy && Date.now() - proxy.failedAt >= PROXY_COOLDOWN_MS ? proxy : null;
   if (route) {
     try {
@@ -89,12 +102,33 @@ export async function ytFetch(url: string, { timeoutMs, ...init }: YtRequest) {
       }
     }
   }
-  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  try {
+    return await fetch(url, { ...init, dispatcher: direct, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (!probe && (isNetworkError(err) || isTimeout(err))) reportNetworkFailure();
+    throw err;
+  }
 }
+
+// Any HTTP answer, even an error status, proves the route works; only a failed request does not.
+setProbe(async () => {
+  const res = await ytFetch(PROBE_URL, { method: "HEAD", timeoutMs: 3_000, probe: true });
+  await res.body?.cancel().catch(() => {});
+  return true;
+});
+
+// After an outage every pooled socket is suspect: start with fresh connections (and give a failed proxy a new chance).
+events.on("network", ({ online }) => {
+  if (!online) return;
+  const old = direct;
+  direct = makeAgent();
+  void old.close().catch(() => {});
+  if (proxy) apply(proxy.url);
+});
 
 // ---------- Shared by every YouTube source ----------
 
-export const REQUEST_TIMEOUT_MS = 8000;
+export const REQUEST_TIMEOUT_MS = 5000;
 
 export const PAGE_HEADERS = {
   "user-agent":
@@ -120,10 +154,31 @@ export class BlockedError extends Error {}
 /** Throttling: back off for minutes, not seconds. */
 export const isThrottle = (err: unknown) => err instanceof BlockedError || (err instanceof HttpError && err.status === 429);
 
-const NETWORK_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"]);
+const NETWORK_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+/** The server decided it is offline, so the request was not even tried. */
+export class OfflineError extends Error {
+  constructor() {
+    super("No internet connection");
+  }
+}
+
+/** A request that ran out of time. Alone it proves nothing: the connectivity probe tells a dead line from a slow server. */
+export const isTimeout = (err: unknown) => err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
 
 /** This machine is offline or DNS is down. That says nothing about whether one YouTube source is healthy. */
 export function isNetworkError(err: unknown): boolean {
+  if (err instanceof OfflineError) return true;
   const cause: unknown = err instanceof Error ? err.cause : null;
   const code = cause && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
   return NETWORK_CODES.has(code);

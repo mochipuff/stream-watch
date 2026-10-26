@@ -3,16 +3,17 @@ import type { SourceName, SourceStateDto } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { YOUTUBE_API_KEY, errorMessage } from "./config.ts";
 import { isSourceEnabled } from "./db.ts";
+import { events } from "./events.ts";
 import { isNetworkError, isThrottle } from "./http.ts";
 
 export const SOURCE_LABEL: Record<SourceName, string> = { rss: "RSS", scrape: "Page scraping", api: "YouTube API" };
 
 // One flaky answer is normal (YouTube sometimes returns a short-lived 404 or 500 on a feed). Only a run of failures, or an
-// explicit throttle (HTTP 429, consent or bot check), pauses a source, and only for a while: 30s, 60s, 2m ... up to 10m.
+// explicit throttle (HTTP 429, consent or bot check), pauses a source, and only for a while: 10s, 20s, 40s ... up to 2m.
 const TRIP_AFTER = 3;
-const BASE_PAUSE_MS = 30_000;
-const MAX_PAUSE_MS = 10 * 60_000;
-const THROTTLE_PAUSE_MS = 5 * 60_000;
+const BASE_PAUSE_MS = 10_000;
+const MAX_PAUSE_MS = 2 * 60_000;
+const THROTTLE_PAUSE_MS = 2 * 60_000;
 
 interface Health {
   fails: number; // consecutive, across all channels: YouTube throttles an IP, not a channel
@@ -77,6 +78,11 @@ export function lock(name: SourceName, ms: number, reason: string) {
 export function reset(name: SourceName) {
   Object.assign(health[name], { fails: 0, until: 0, paused: false, error: null });
 }
+
+// An outage (and the timeouts it caused before it was noticed) must not leave a source resting after the connection is back.
+events.on("network", () => {
+  for (const name of SOURCE_NAMES) reset(name);
+});
 
 export function sourceStates(): Record<SourceName, SourceStateDto> {
   const now = Date.now();

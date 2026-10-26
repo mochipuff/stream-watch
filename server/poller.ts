@@ -3,10 +3,12 @@ import { MAX_INTERVAL_MS, MIN_INTERVAL_MS, VIDEO_ID_RE } from "../shared/contrac
 import type { CheckSource, CheckSummary } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
+import { isOnline, reportNetworkFailure, waitUntilOnline } from "./connectivity.ts";
 import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
 import type { KindSettings } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
+import { OfflineError, isNetworkError, isTimeout } from "./http.ts";
 import { SOURCE_LABEL } from "./sources.ts";
 import { lookupStreams, thumbnailFor } from "./youtube.ts";
 import type { Stream } from "./youtube.ts";
@@ -29,8 +31,8 @@ interface Channel {
 }
 
 export class CheckRejectedError extends Error {
-  status: 409 | 429;
-  constructor(status: 409 | 429, message: string) {
+  status: 409 | 429 | 503;
+  constructor(status: 409 | 429 | 503, message: string) {
     super(message);
     this.status = status;
   }
@@ -45,6 +47,7 @@ export const state: { running: boolean; lastCycleAt: number | null; nextCycleAt:
 const MAX_PARALLEL_CHANNELS = 3;
 const MANUAL_TTL_SEC = 14 * 86_400; // a video added by hand that never goes live stops being checked after two weeks
 const MANUAL_GAP_MS = 5000;
+const MAX_BACKOFF_MS = 30_000; // a channel is never skipped for long: a stream can start any second
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 // Exponential backoff per channel / webhook so a failing target is not hammered every few seconds.
@@ -53,7 +56,7 @@ const penalty = new Map<string, { n: number; until: number }>();
 const blocked = (key: string) => (penalty.get(key)?.until ?? 0) > Date.now();
 const fail = (key: string) => {
   const n = (penalty.get(key)?.n ?? 0) + 1;
-  penalty.set(key, { n, until: Date.now() + Math.min(5000 * 2 ** n, 300_000) });
+  penalty.set(key, { n, until: Date.now() + Math.min(2000 * 2 ** n, MAX_BACKOFF_MS) });
 };
 const ok = (key: string) => penalty.delete(key);
 
@@ -76,7 +79,13 @@ const claim = query(
   `INSERT OR IGNORE INTO sent_streams (webhook_id, video_id, channel_id, title, start_at, sent_at, channel_name, status, delivered)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 );
-const confirm = query("UPDATE sent_streams SET delivered = 1 WHERE webhook_id = ? AND video_id = ?");
+// A stream announced as upcoming gets one more message when it goes live (the Live message of the channel). Same atomic idea as the
+// claim: only one caller can turn the `upcoming` row into an unconfirmed `live` one. A failed send turns it back.
+const promote = query("UPDATE sent_streams SET status = 'live', delivered = 0 WHERE webhook_id = ? AND video_id = ? AND status = 'upcoming' AND delivered = 1");
+const demote = query("UPDATE sent_streams SET status = 'upcoming', delivered = 1 WHERE webhook_id = ? AND video_id = ? AND status = 'live' AND delivered = 0");
+const confirm = query(
+  "UPDATE sent_streams SET delivered = 1, sent_at = ?, title = ?, start_at = ?, channel_name = ?, status = ? WHERE webhook_id = ? AND video_id = ?",
+);
 const release = query("DELETE FROM sent_streams WHERE webhook_id = ? AND video_id = ? AND delivered = 0");
 // A crash or restart between claim and confirm would otherwise turn into a notification that is never sent.
 const discardUnconfirmed = query("DELETE FROM sent_streams WHERE delivered = 0");
@@ -100,16 +109,23 @@ function wanted(stream: Stream, kinds: KindSettings): boolean {
   return isStream(stream) || (kind.since > 0 && stream.startAt !== null && stream.startAt >= kind.since);
 }
 
-async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channelName: string, stream: Stream, force: boolean): Promise<boolean> {
+type Outcome = "sent" | "already" | "failed";
+
+async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channelName: string, stream: Stream, force: boolean): Promise<Outcome> {
   const key = `hook:${hook.id}`;
-  if (!force && blocked(key)) return false;
+  if (!isOnline() || (!force && blocked(key))) return "failed";
   const sentAt = nowSec();
-  const claimed =
+  let claimed =
     Number(claim.run(hook.id, stream.videoId, channel.id, stream.title, stream.startAt, sentAt, channelName, stream.status).changes) === 1;
+  let promoted = false;
+  if (!claimed && stream.status === "live") {
+    promoted = Number(promote.run(hook.id, stream.videoId).changes) === 1;
+    claimed = promoted;
+  }
   if (!claimed) {
-    // Only a stream changes (new title, new start time, live now). A VOD or Short is final, and a stream that has become a VOD keeps what it was announced as.
+    // Only a stream changes (new title, new start time). A VOD or Short is final, and a stream that has become a VOD keeps what it was announced as.
     if (isStream(stream)) refresh.run(stream.title, stream.startAt, channelName, stream.status, hook.id, stream.videoId, stream.title, stream.startAt, channelName, stream.status);
-    return false;
+    return "already";
   }
   try {
     const thumbnail = await thumbnailFor(stream.videoId);
@@ -118,17 +134,23 @@ async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channe
       buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: kinds[stream.status].message, roleIds: parseRoleIds(channel.role_ids) }),
     );
   } catch (err) {
-    release.run(hook.id, stream.videoId); // failed send must be retried later
-    fail(key);
-    const message = errorMessage(err);
-    if (hook.error !== message) {
-      hook.error = message;
-      setHookError.run(message, hook.id);
-      audit("error", "webhook.error", `${hook.name}: ${message}`);
+    if (promoted) demote.run(hook.id, stream.videoId);
+    else release.run(hook.id, stream.videoId); // failed send must be retried later
+    // A dead connection says nothing about the webhook: no back-off, no error on it. The next cycle retries.
+    const lineDown = isNetworkError(err);
+    if (lineDown || isTimeout(err)) reportNetworkFailure();
+    if (!lineDown) {
+      fail(key);
+      const message = errorMessage(err);
+      if (hook.error !== message) {
+        hook.error = message;
+        setHookError.run(message, hook.id);
+        audit("error", "webhook.error", `${hook.name}: ${message}`);
+      }
     }
-    return false;
+    return "failed";
   }
-  confirm.run(hook.id, stream.videoId);
+  confirm.run(sentAt, stream.title, stream.startAt, channelName, stream.status, hook.id, stream.videoId);
   ok(key);
   if (hook.error) {
     hook.error = null;
@@ -145,7 +167,7 @@ async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channe
     sentAt,
   });
   events.emit("changed"); // "Recently sent" updates now, not when the whole cycle ends
-  return true;
+  return "sent";
 }
 
 // A change of source is only worth a line when it means a worse (API) or manual-only answer, or the return from one:
@@ -153,9 +175,13 @@ async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channe
 const isFallback = (source: CheckSource | null) => source === "api" || source === "manual";
 const labelOf = (source: CheckSource) => (source === "manual" ? "the manual videos only" : SOURCE_LABEL[source]);
 
-async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Promise<{ sent: number; failed: boolean }> {
+type Tally = Omit<CheckSummary, "channels" | "failed"> & { failed: number };
+const emptyTally = (): Tally => ({ sent: 0, failed: 0, already: 0, disabled: 0, unlinked: 0 });
+
+async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Promise<Tally> {
   const key = `ch:${channel.id}`;
-  if (!force && blocked(key)) return { sent: 0, failed: false };
+  const tally = emptyTally();
+  if (!isOnline() || (!force && blocked(key))) return tally;
   try {
     const manualIds = manualOf.all(channel.id).map((row) => row.video_id);
     const found = await lookupStreams({ handle: channel.handle, youtubeId: channel.youtube_id, name: channel.name }, { force, manualIds });
@@ -179,6 +205,7 @@ async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Pr
       audit("warn", "video.foreign", `Manual video ${id} belongs to another channel than ${channel.handle} and was removed`);
     }
 
+    if (!isOnline()) return tally; // the line dropped during this check: that is not the channel's error
     if (found.error) {
       fail(key);
       if (channel.error !== found.error) {
@@ -197,14 +224,24 @@ async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Pr
       );
     }
 
-    let sent = 0;
     const kinds = parseKinds(channel.kinds);
     for (const stream of streams) {
-      if (!wanted(stream, kinds)) continue;
-      for (const hook of hooks) if (await deliver(hook, channel, kinds, found.channelName, stream, force)) sent++;
+      if (!wanted(stream, kinds)) {
+        if (isStream(stream)) tally.disabled++;
+        continue;
+      }
+      if (hooks.length === 0 && isStream(stream)) tally.unlinked++;
+      for (const hook of hooks) {
+        const outcome = await deliver(hook, channel, kinds, found.channelName, stream, force);
+        if (outcome === "sent") tally.sent++;
+        else if (outcome === "failed") tally.failed++;
+        else if (isStream(stream)) tally.already++;
+      }
     }
-    return { sent, failed: found.error !== null };
+    if (found.error !== null) tally.failed++;
+    return tally;
   } catch (err) {
+    if (err instanceof OfflineError || !isOnline()) return tally;
     fail(key);
     const message = errorMessage(err);
     markFailed.run(nowSec(), message, channel.id);
@@ -213,7 +250,8 @@ async function checkChannel(channel: Channel, hooks: Hook[], force: boolean): Pr
       events.emit("channel_error", { channelId: channel.id, handle: channel.handle, error: message });
       audit("error", "channel.error", `${channel.handle}: ${message}`);
     }
-    return { sent: 0, failed: true };
+    tally.failed++;
+    return tally;
   }
 }
 
@@ -237,15 +275,14 @@ async function run({ channelId, manual }: Scope): Promise<CheckSummary> {
       // The automatic cycle skips a channel nobody is subscribed to, so it costs no YouTube request.
       return manual || channelHooks.length > 0 ? [{ channel, hooks: channelHooks }] : [];
     });
-    const summary: CheckSummary = { channels: work.length, sent: 0, failed: 0 };
+    const summary: CheckSummary = { channels: work.length, sent: 0, failed: 0, already: 0, disabled: 0, unlinked: 0 };
     // Bounded concurrency: many channels must not become a burst of simultaneous YouTube requests.
     let next = 0;
     const worker = async () => {
       while (next < work.length) {
         const item = work[next++]!;
         const result = await checkChannel(item.channel, item.hooks, manual);
-        summary.sent += result.sent;
-        if (result.failed) summary.failed++;
+        for (const field of ["sent", "failed", "already", "disabled", "unlinked"] as const) summary[field] += result[field];
       }
     };
     await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_CHANNELS, work.length) }, worker));
@@ -257,6 +294,17 @@ async function run({ channelId, manual }: Scope): Promise<CheckSummary> {
   }
 }
 
+/** "1 sent, 1 already sent before": a check that sends nothing says why. */
+export function describe({ sent, failed, already, disabled, unlinked }: CheckSummary): string {
+  const notes = [
+    failed && `${failed} failed`,
+    already && `${already} already sent before`,
+    disabled && `${disabled} switched off for the channel`,
+    unlinked && `${unlinked} on a channel without webhook`,
+  ].filter(Boolean);
+  return `${sent} sent${notes.length ? ` (${notes.join(", ")})` : ""}`;
+}
+
 let lastManualAt = 0;
 
 /**
@@ -265,22 +313,22 @@ let lastManualAt = 0;
  */
 export function startCheck(channelId?: string): void {
   if (state.running) throw new CheckRejectedError(409, "A check is already running");
+  if (!isOnline()) throw new CheckRejectedError(503, "No internet connection. Checks start again by themselves when it is back.");
   const wait = lastManualAt + MANUAL_GAP_MS - Date.now();
   if (wait > 0) throw new CheckRejectedError(429, `Wait ${Math.ceil(wait / 1000)}s before checking again`);
   lastManualAt = Date.now();
   void run({ channelId, manual: true }).then(
     (summary) => {
       const target = channelId ? (handleOf.get(channelId)?.handle ?? "channel") : `${summary.channels} channels`;
-      audit(
-        summary.failed ? "warn" : "info",
-        "check.manual",
-        `Manual check of ${target}: ${summary.sent} sent${summary.failed ? `, ${summary.failed} failed` : ""}`,
-      );
+      audit(summary.failed ? "warn" : "info", "check.manual", `Manual check of ${target}: ${describe(summary)}`);
       events.emit("check_done", { ...summary, target });
     },
     (err) => audit("error", "check.manual", `Manual check failed: ${errorMessage(err)}`),
   );
 }
+
+// Penalties earned during an outage (or just before it was noticed) are not the channel's fault: start clean on both edges.
+events.on("network", () => penalty.clear());
 
 let stopped = false;
 let wake = new AbortController();
@@ -328,6 +376,11 @@ export function startPoller() {
       if (!isAutoEnabled()) {
         setNext(null);
         await nap(MAX_INTERVAL_MS);
+        continue;
+      }
+      if (!isOnline()) {
+        setNext(null);
+        await waitUntilOnline(wake.signal); // the first cycle after the outage starts the moment the connection is stable
         continue;
       }
       const started = Date.now();

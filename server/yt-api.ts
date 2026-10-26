@@ -14,6 +14,7 @@ const MAX_API_BYTES = 256 * 1024;
 const MAX_PLAYLIST_ITEMS = 15;
 const MAX_IDS_PER_CALL = 50;
 const QUOTA_LOCK_MS = 3_600_000;
+const RATE_LOCK_MS = 30_000; // a per-second limit clears in moments, unlike the daily quota
 
 class ApiError extends Error {
   reason: string;
@@ -71,9 +72,11 @@ async function apiGet<S extends z.ZodType>(path: string, params: Record<string, 
   const body = await readBounded(res, MAX_API_BYTES);
   if (!res.ok) {
     const reason = apiReason(body);
-    if (/quota|dailyLimit|rateLimit/i.test(reason)) {
+    if (/quota|dailyLimit/i.test(reason)) {
       lock("api", QUOTA_LOCK_MS, "quota is used up");
       audit("warn", "api.quota", "YouTube API quota is used up. API checks are paused for 1 hour.");
+    } else if (/rateLimit/i.test(reason)) {
+      lock("api", RATE_LOCK_MS, "too many requests per second");
     }
     throw new ApiError(res.status, reason);
   }

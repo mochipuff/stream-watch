@@ -49,12 +49,23 @@ export function useRealtime(): boolean {
             void queryClient.invalidateQueries({ queryKey: AUDIT_KEY });
             break;
           case "check_done": {
-            const { target, sent, failed } = message.data;
-            const text = `${target}: ${sent} sent${failed ? `, ${failed} failed` : ""}`;
+            const { target, sent, failed, already, disabled, unlinked } = message.data;
+            const notes = [
+              failed && `${failed} failed`,
+              already && `${already} already sent before`,
+              disabled && `${disabled} switched off for the channel`,
+              unlinked && `${unlinked} on a channel without webhook`,
+            ].filter(Boolean);
+            const text = `${target}: ${sent} sent${notes.length ? ` (${notes.join(", ")})` : ""}`;
             if (failed) toast.error(text, "Check finished");
+            else if (!sent && notes.length) toast.info(text, "Check finished");
             else toast.success(text, "Check finished");
             break;
           }
+          case "network":
+            if (message.data.online) toast.success("Connection is back and stable. Checking now.", "Online");
+            else toast.error("No internet connection. Checks start again by themselves when it is back.", "Offline");
+            break;
           case "stream_sent":
             toast.success(
               `"${message.data.title}" (${message.data.handle}) was sent to "${message.data.webhookName}"`,

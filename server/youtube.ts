@@ -5,7 +5,7 @@ import { query } from "./db.ts";
 import { HttpError, NotFoundError, PAGE_HEADERS, REQUEST_TIMEOUT_MS, ensureOk, isThrottle, readBounded, ytFetch } from "./http.ts";
 import { SOURCE_LABEL, canUse, failed, pauseNote, succeeded } from "./sources.ts";
 import { classifyByApi, discoverByApi, resolveByApi } from "./yt-api.ts";
-import { classifyByPages, resolveChannelId, scrapeChannel } from "./yt-pages.ts";
+import { classifyByPages, liveNowId, resolveChannelId, scrapeChannel } from "./yt-pages.ts";
 import type { Scraped } from "./yt-pages.ts";
 
 export interface Stream {
@@ -49,7 +49,12 @@ export interface Lookup {
 const MAX_FEED_BYTES = 512 * 1024;
 const MAX_CANDIDATES = 15;
 const MAX_PAGE_LOOKUPS_PER_CHECK = 5;
-const STREAM_TTL_MS = 5 * 60_000;
+// How long a live or upcoming verdict is trusted. A stream that is about to start (or is late) is read again on every cycle, because the
+// change to "live" is the one thing that has to be seen at once. One that is far away is read less often.
+const LIVE_TTL_MS = 30_000;
+const SOON_MS = 10 * 60_000;
+const SOON_TTL_MS = 5_000;
+const FAR_TTL_MS = 2 * 60_000;
 const PLAIN_TTL_SEC = 14 * 86_400;
 // The channel pages are 1 to 3 MB each. They run on a slower clock than the RSS feed (a few KB) unless RSS is down.
 const PAGES_TTL_RSS_UP_MS = 2 * 60_000;
@@ -80,10 +85,16 @@ function remember(videoId: string, stream: Stream | null) {
   // Unblock in case it was previously misclassified as a plain video
   deletePlain.run(videoId);
   if (streamMemo.size >= 200) streamMemo.delete(streamMemo.keys().next().value!);
-  streamMemo.set(videoId, { stream, until: Date.now() + STREAM_TTL_MS });
+  streamMemo.set(videoId, { stream, until: Date.now() + memoTtlMs(stream) });
 }
 
-function cached(videoId: string): { known: true; stream: Stream | null } | { known: false } {
+function memoTtlMs({ status, startAt }: Stream): number {
+  if (status === "live") return LIVE_TTL_MS;
+  const eta = startAt === null ? 0 : startAt * 1000 - Date.now();
+  return eta <= SOON_MS ? SOON_TTL_MS : Math.min(FAR_TTL_MS, eta - SOON_MS);
+}
+
+function cached(videoId: string, force: boolean): { known: true; stream: Stream | null } | { known: false } {
   const plain = findPlain.get(videoId);
   if (plain) {
     const { kind, title } = plain;
@@ -92,7 +103,7 @@ function cached(videoId: string): { known: true; stream: Stream | null } | { kno
       kind && title ? { videoId, title, status: kind, startAt: plain.published_at, channelId: plain.channel_id ?? undefined } : null;
     return { known: true, stream };
   }
-  const memo = streamMemo.get(videoId);
+  const memo = force ? undefined : streamMemo.get(videoId); // a manual check reads live and upcoming videos again
   return memo && memo.until > Date.now() ? { known: true, stream: memo.stream } : { known: false };
 }
 
@@ -185,6 +196,12 @@ async function discover(handle: string, channelId: string, force: boolean): Prom
       out.ids.push(...memo.scraped.ids);
       out.name ??= memo.scraped.name;
       out.answered.push("scrape");
+      // The channel page is only re-read now and then, but "live right now" is cheap and is asked on every cycle.
+      const liveId = await liveNowId(channelId).catch((err: unknown) => {
+        if (isThrottle(err)) failed("scrape", err);
+        return null;
+      });
+      if (liveId) out.ids.push(liveId);
     } else {
       try {
         const scraped = await scrapeChannel(handle, channelId);
@@ -254,7 +271,7 @@ async function classify(videoIds: readonly string[], force: boolean): Promise<Ma
   const verdicts = new Map<string, Stream | null>();
   const unknown: string[] = [];
   for (const id of videoIds) {
-    const hit = cached(id);
+    const hit = cached(id, force);
     if (hit.known) verdicts.set(id, hit.stream);
     else unknown.push(id);
   }
@@ -336,7 +353,7 @@ export async function thumbnailFor(videoId: string): Promise<string> {
   if (cachedUrl) return cachedUrl;
   const max = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   try {
-    const res = await ytFetch(max, { method: "HEAD", redirect: "error", timeoutMs: 4000 });
+    const res = await ytFetch(max, { method: "HEAD", redirect: "error", timeoutMs: 2500 });
     if (res.ok || res.status === 404) {
       const url = res.ok ? max : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
       if (thumbnails.size >= 200) thumbnails.delete(thumbnails.keys().next().value!);

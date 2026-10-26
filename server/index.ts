@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { HOST, PORT } from "./config.ts"; // first: validates the environment before anything opens the database
 import { app } from "./api.ts";
+import { stopConnectivity } from "./connectivity.ts";
 import { DB_FILE, db } from "./db.ts";
 import { startPoller, stopPoller } from "./poller.ts";
 import { attachRealtime, closeRealtime } from "./realtime.ts";
@@ -30,6 +31,7 @@ attachRealtime(server);
 
 function shutdown() {
   stopPoller();
+  stopConnectivity();
   closeRealtime();
   server.closeAllConnections();
   server.close(() => {

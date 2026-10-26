@@ -9,12 +9,14 @@ import { ChipGroup, RelativeTime, ToastContainer, buttonCls, quietCls, useNow } 
 
 function StatusLine({ cycle, hasHooks, connected }: { cycle: CycleDto; hasHooks: boolean; connected: boolean }) {
   const now = useNow();
-  const { auto, running, intervalMs, lastCycleAt } = cycle;
-  const healthy = !auto || (lastCycleAt !== null && now - lastCycleAt < intervalMs * 3 + 10_000);
+  const { auto, running, intervalMs, lastCycleAt, online } = cycle;
+  const healthy = !online ? false : !auto || (lastCycleAt !== null && now - lastCycleAt < intervalMs * 3 + 10_000);
   return (
     <p className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted">
       <span className={`inline-block size-2.5 rounded-full ${healthy ? "bg-ok" : "bg-signal"}`} />
-      {running ? (
+      {!online ? (
+        "No internet. Waiting for a stable connection, then checking again."
+      ) : running ? (
         "Checking…"
       ) : !hasHooks ? (
         "Paused. Add a Discord webhook to start."

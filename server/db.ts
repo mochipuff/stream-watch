@@ -205,7 +205,7 @@ const deleteSetting = query("DELETE FROM settings WHERE key = ?");
 export const getSetting = (key: string): string | null => readSetting.get(key)?.value ?? null;
 export const setSetting = (key: string, value: string | null) => (value === null ? deleteSetting.run(key) : writeSetting.run(key, value));
 
-const DEFAULT_INTERVAL_MS = 30_000;
+const DEFAULT_INTERVAL_MS = 15_000;
 
 // Never returns NaN or an out-of-range value, so timers can never spin at 1ms.
 export function getIntervalMs(): number {

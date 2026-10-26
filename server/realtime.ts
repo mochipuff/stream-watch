@@ -17,6 +17,7 @@ function broadcast(message: WsMessage) {
 events.on("stream_sent", (data) => broadcast({ type: "stream_sent", data }));
 events.on("channel_error", (data) => broadcast({ type: "channel_error", data }));
 events.on("check_done", (data) => broadcast({ type: "check_done", data }));
+events.on("network", (data) => broadcast({ type: "network", data }));
 
 // Several changes in a row (a cycle that sends to many webhooks) become one push instead of one each.
 function coalesced(delayMs: number, push: () => void) {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const MIN_INTERVAL_MS = 30_000;
+export const MIN_INTERVAL_MS = 10_000;
 export const MAX_INTERVAL_MS = 86_400_000;
 export const MAX_CHANNELS = 500;
 export const MAX_MESSAGE_LENGTH = 1000;
@@ -176,6 +176,7 @@ export interface CycleDto {
   auto: boolean;
   running: boolean;
   intervalMs: number;
+  online: boolean; // false while the connection is down: checks wait and start again by themselves
   lastCycleAt: number | null; // unix milliseconds
   nextCycleAt: number | null; // unix milliseconds, null while auto checks are off
 }
@@ -206,6 +207,12 @@ export interface CheckSummary {
   channels: number;
   sent: number;
   failed: number;
+  /** A live or upcoming stream was found, but this webhook already got that message. */
+  already: number;
+  /** A live or upcoming stream was found, but that kind is switched off for the channel. */
+  disabled: number;
+  /** A live or upcoming stream was found, but the channel has no webhook. */
+  unlinked: number;
 }
 
 export interface CheckDoneEvent extends CheckSummary {
@@ -234,6 +241,10 @@ export interface StreamSentEvent {
   sentAt: number;
 }
 
+export interface NetworkEvent {
+  online: boolean;
+}
+
 export interface ChannelErrorEvent {
   channelId: string;
   handle: string;
@@ -245,4 +256,5 @@ export type WsMessage =
   | { type: "audit" }
   | { type: "stream_sent"; data: StreamSentEvent }
   | { type: "channel_error"; data: ChannelErrorEvent }
-  | { type: "check_done"; data: CheckDoneEvent };
+  | { type: "check_done"; data: CheckDoneEvent }
+  | { type: "network"; data: NetworkEvent };
