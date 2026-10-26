@@ -4,7 +4,7 @@ import type { CheckSource, CheckSummary } from "../shared/contract.ts";
 import { audit } from "./audit.ts";
 import { errorMessage } from "./config.ts";
 import { isOnline, reportNetworkFailure, waitUntilOnline } from "./connectivity.ts";
-import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
+import { getIntervalMs, isAutoEnabled, parseKinds, query } from "./db.ts";
 import type { KindSettings } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
@@ -27,7 +27,6 @@ interface Channel {
   source: CheckSource | null;
   error: string | null;
   kinds: string | null;
-  role_ids: string;
 }
 
 export class CheckRejectedError extends Error {
@@ -66,7 +65,7 @@ export function forget(id: string) {
 }
 
 const enabledHooks = query<Hook>("SELECT id, name, url, error FROM webhooks WHERE enabled = 1");
-const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, kinds, role_ids FROM channels WHERE enabled = 1 ORDER BY rowid");
+const enabledChannels = query<Channel>("SELECT id, handle, youtube_id, name, source, error, kinds FROM channels WHERE enabled = 1 ORDER BY rowid");
 const allLinks = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const handleOf = query<{ handle: string }>("SELECT handle FROM channels WHERE id = ?");
 const manualOf = query<{ video_id: string }>("SELECT video_id FROM manual_videos WHERE channel_id = ? ORDER BY added_at");
@@ -131,7 +130,7 @@ async function deliver(hook: Hook, channel: Channel, kinds: KindSettings, channe
     const thumbnail = await thumbnailFor(stream.videoId);
     await postWebhook(
       hook.url,
-      buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: kinds[stream.status].message, roleIds: parseRoleIds(channel.role_ids) }),
+      buildPayload({ channelName, handle: channel.handle, video: stream, thumbnail, message: kinds[stream.status].message }),
     );
   } catch (err) {
     if (promoted) demote.run(hook.id, stream.videoId);

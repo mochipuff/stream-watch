@@ -346,22 +346,19 @@ export async function lookupStreams(channel: ChannelRef, { force, manualIds }: L
   };
 }
 
-const thumbnails = new Map<string, string>();
-
+/**
+ * The thumbnail URL for one message. Nothing is remembered between sends: a creator can change the thumbnail of a waiting room
+ * under the same video id, and the image URL stays the same. A fresh `?v=` makes Discord's image proxy (and the probe below)
+ * fetch the picture again instead of showing the copy it kept from the first announcement.
+ */
 export async function thumbnailFor(videoId: string): Promise<string> {
-  const cachedUrl = thumbnails.get(videoId);
-  if (cachedUrl) return cachedUrl;
-  const max = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+  const version = `?v=${Math.floor(Date.now() / 1000)}`;
+  const max = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg${version}`;
   try {
     const res = await ytFetch(max, { method: "HEAD", redirect: "error", timeoutMs: 2500 });
-    if (res.ok || res.status === 404) {
-      const url = res.ok ? max : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-      if (thumbnails.size >= 200) thumbnails.delete(thumbnails.keys().next().value!);
-      thumbnails.set(videoId, url);
-      return url;
-    }
+    if (res.status === 404) return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg${version}`;
   } catch {
-    // Network hiccup: not cached, the next send probes again.
+    // Network hiccup: send the max-res URL, Discord falls back to no image rather than failing the message.
   }
   return max;
 }

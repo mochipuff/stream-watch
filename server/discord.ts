@@ -12,21 +12,32 @@ interface PayloadInput {
   video: { videoId: string; title: string; status: ContentKind; startAt: number | null };
   thumbnail: string;
   message?: string | null;
-  roleIds?: readonly string[];
 }
 
-const PLACEHOLDER_RE = /@\{roleid\}|\{user\}/gi;
-const ROLE_TOKEN_RE = /@\{roleid\}/i;
+// Discord's own mention syntax, typed straight into the message: `<@&roleId>`, `<@userId>`, `@everyone` and `@here`.
+// `{user}` becomes the channel handle.
+const MENTION_RE = /<@&(\d{17,20})>|<@!?(\d{17,20})>|(?<!\w)@(everyone|here)(?!\w)/g;
+const USER_TOKEN_RE = /\{user\}/gi;
 
 /**
- * `{user}` becomes the channel handle and `@{roleid}` becomes a mention of every role saved for that handle.
- * Only the saved roles are allowed to ping (see `allowed_mentions`), so a typed `<@&id>`, `@everyone` or `@here` never pings.
+ * Mentions are read from the template the person typed, never from the rendered text, so a handle can never add a ping
+ * (`@everyone` is a valid handle). Only what was typed can notify: `allowed_mentions` lists exactly those ids.
  */
-function renderMessage(template: string | null | undefined, handle: string | null, roleIds: readonly string[]) {
-  if (!template) return { content: undefined, roles: [] };
-  const mentions = roleIds.map((id) => `<@&${id}>`).join(" ");
-  const text = template.replace(PLACEHOLDER_RE, (token) => (token.toLowerCase() === "{user}" ? (handle ?? "") : mentions));
-  return { content: clip(text.trim(), 2000) || undefined, roles: ROLE_TOKEN_RE.test(template) ? [...roleIds] : [] };
+function renderMessage(template: string | null | undefined, handle: string | null) {
+  const roles = new Set<string>();
+  const users = new Set<string>();
+  let everyone = false;
+  if (!template) return { content: undefined, allowedMentions: { parse: [] as string[], roles: [] as string[], users: [] as string[] } };
+  for (const [, role, user, broadcast] of template.matchAll(MENTION_RE)) {
+    if (role) roles.add(role);
+    else if (user) users.add(user);
+    else if (broadcast) everyone = true;
+  }
+  const text = template.replace(USER_TOKEN_RE, handle ?? "");
+  return {
+    content: clip(text.trim(), 2000) || undefined,
+    allowedMentions: { parse: everyone ? ["everyone"] : [], roles: [...roles], users: [...users] },
+  };
 }
 
 const FOOTER: Record<ContentKind, string> = { upcoming: "Upcoming stream", live: "Live stream", vod: "Video", short: "Short" };
@@ -43,13 +54,13 @@ function describe({ status, startAt }: PayloadInput["video"]): string | undefine
 }
 
 // No `username` on purpose: Discord shows the webhook's own default name and avatar.
-export function buildPayload({ channelName, handle, video, thumbnail, message, roleIds = [] }: PayloadInput) {
-  const { content, roles } = renderMessage(message, handle, roleIds);
+export function buildPayload({ channelName, handle, video, thumbnail, message }: PayloadInput) {
+  const { content, allowedMentions } = renderMessage(message, handle);
   const url = `https://www.youtube.com/${video.status === "short" ? "shorts/" : "watch?v="}${video.videoId}`;
   const description = describe(video);
   return {
     ...(content ? { content } : {}),
-    allowed_mentions: { parse: [], roles },
+    allowed_mentions: allowedMentions,
     embeds: [
       {
         title: clip(video.title, 256),
@@ -61,7 +72,7 @@ export function buildPayload({ channelName, handle, video, thumbnail, message, r
         footer: { text: FOOTER[video.status] },
       },
     ],
-    components: [{ type: 1, components: [{ type: 2, style: 5, label: "Watch on YouTube", url }] }],
+    components: [{ type: 1, components: [{ type: 2, style: 5, label: video.status === "upcoming" ? "Waiting room" : "Watch on YouTube", url }] }],
   };
 }
 

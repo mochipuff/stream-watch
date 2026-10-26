@@ -125,20 +125,18 @@ const KIND_HINT: Record<ContentKind, string> = {
 function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClose: () => void }) {
   const [drafts, setDrafts] = useState(() => Object.fromEntries(CONTENT_KINDS.map((k) => [k, { enabled: channel.kinds[k].enabled, message: channel.kinds[k].message ?? "" }])) as Record<ContentKind, { enabled: boolean; message: string }>);
   const [kind, setKind] = useState<ContentKind>("upcoming");
-  const [roles, setRoles] = useState(channel.roleIds.join("\n"));
   const draft = drafts[kind];
   const change = (next: Partial<typeof draft>) => setDrafts((all) => ({ ...all, [kind]: { ...all[kind], ...next } }));
   const save = useAction(() =>
     api.patchChannel(channel.id, {
       kinds: Object.fromEntries(CONTENT_KINDS.map((k) => [k, { enabled: drafts[k].enabled, message: drafts[k].message.trim() || null }])),
-      roleIds: roles.split(/[\s,]+/).filter(Boolean),
     }),
   );
 
   return (
     <Dialog
       title={`Messages for ${channel.handle}`}
-      hint="Sent above the embed. {user} becomes the handle, @{roleid} mentions every role below. Leave a message empty to send the embed only."
+      hint="Sent above the embed. {user} becomes the handle. Mention the Discord way: <@&roleId>, <@userId>, @everyone or @here. Leave a message empty to send the embed only."
       onClose={onClose}
     >
       <div className="mt-4">
@@ -162,20 +160,9 @@ function ChannelMessageDialog({ channel, onClose }: { channel: ChannelDto; onClo
         className={`${inputCls} mt-1 w-full`}
         rows={4}
         maxLength={MAX_MESSAGE_LENGTH}
-        placeholder="@{roleid} {user} is streaming!"
+        placeholder="<@&123456789012345678> {user} is streaming!"
         value={draft.message}
         onChange={(e) => change({ message: e.target.value })}
-      />
-      <label className="mt-3 block text-xs font-semibold text-muted" htmlFor="channel-roles">
-        Role IDs to mention (one per line, shared by all kinds)
-      </label>
-      <textarea
-        id="channel-roles"
-        className={`${inputCls} mt-1 w-full font-mono`}
-        rows={3}
-        spellCheck={false}
-        value={roles}
-        onChange={(e) => setRoles(e.target.value)}
       />
       <div className="mt-5 flex justify-end gap-2">
         <button className={quietCls} onClick={onClose}>

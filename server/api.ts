@@ -8,7 +8,7 @@ import { CONTENT_KINDS, KIND_LABEL, MAX_CHANNELS, MAX_MANUAL_VIDEOS, SOURCE_NAME
 import type { ContentKind } from "../shared/contract.ts";
 import { audit, readAudit } from "./audit.ts";
 import { errorMessage, guardRequest } from "./config.ts";
-import { parseKinds, parseRoleIds, query, setSetting, tx } from "./db.ts";
+import { parseKinds, query, setSetting, tx } from "./db.ts";
 import type { KindSettings } from "./db.ts";
 import { buildPayload, postWebhook } from "./discord.ts";
 import { events } from "./events.ts";
@@ -77,7 +77,6 @@ const handleTaken = query("SELECT 1 FROM channels WHERE handle = ? COLLATE NOCAS
 const insertChannel = query("INSERT INTO channels (id, handle) VALUES (?, ?)");
 const setChannelEnabled = query("UPDATE channels SET enabled = ? WHERE id = ?");
 const setChannelKinds = query("UPDATE channels SET kinds = ? WHERE id = ?");
-const setChannelRoles = query("UPDATE channels SET role_ids = ? WHERE id = ?");
 const deleteChannel = query("DELETE FROM channels WHERE id = ?"); // links go with it (ON DELETE CASCADE)
 const manualCount = query<{ n: number }>("SELECT COUNT(*) AS n FROM manual_videos WHERE channel_id = ?");
 const insertManual = query("INSERT OR IGNORE INTO manual_videos (channel_id, video_id, added_at) VALUES (?, ?, ?)");
@@ -101,9 +100,8 @@ const resendRow = query<{
   webhook_name: string;
   handle: string | null;
   kinds: string | null;
-  role_ids: string | null;
 }>(
-  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle, c.kinds, c.role_ids
+  `SELECT s.title, s.start_at, s.channel_name, s.status, w.url, w.name AS webhook_name, c.handle, c.kinds
    FROM sent_streams s
    JOIN webhooks w ON w.id = s.webhook_id
    LEFT JOIN channels c ON c.id = s.channel_id
@@ -182,7 +180,6 @@ app.patch("/api/channels/:id", async (c) => {
     if (body.enabled !== undefined) setChannelEnabled.run(body.enabled ? 1 : 0, id);
     if (body.webhookIds) setLinks(id, body.webhookIds);
     if (body.kinds) setChannelKinds.run(JSON.stringify(mergeKinds(parseKinds(current.kinds), body.kinds, Math.floor(Date.now() / 1000))), id);
-    if (body.roleIds) setChannelRoles.run(body.roleIds.join(","), id);
     return current;
   });
   if (body.enabled !== undefined && body.enabled !== Boolean(row.enabled)) {
@@ -193,7 +190,6 @@ app.patch("/api/channels/:id", async (c) => {
     const names = CONTENT_KINDS.filter((kind) => body.kinds?.[kind]).map((kind) => KIND_LABEL[kind]);
     audit("info", "channel.message", `Updated the ${names.join(", ")} settings of ${row.handle}`);
   }
-  if (body.roleIds) audit("info", "channel.roles", `Updated the mentioned roles of ${row.handle}`);
   return changed(c);
 });
 
@@ -313,7 +309,6 @@ app.post("/api/sent/:webhookId/:videoId/resend", async (c) => {
         video: { videoId, title: row.title, status: row.status, startAt: row.start_at },
         thumbnail: await thumbnailFor(videoId),
         message: parseKinds(row.kinds)[row.status].message,
-        roleIds: parseRoleIds(row.role_ids),
       }),
     );
   } catch (err) {

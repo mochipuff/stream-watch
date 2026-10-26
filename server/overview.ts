@@ -1,6 +1,6 @@
 import { CONTENT_KINDS } from "../shared/contract.ts";
 import type { ChannelDto, CheckSource, ContentKind, CycleDto, Overview } from "../shared/contract.ts";
-import { getIntervalMs, isAutoEnabled, parseKinds, parseRoleIds, query } from "./db.ts";
+import { getIntervalMs, isAutoEnabled, parseKinds, query } from "./db.ts";
 import { isOnline } from "./connectivity.ts";
 import { proxyStatus } from "./http.ts";
 import { state } from "./poller.ts";
@@ -17,8 +17,7 @@ const channelRows = query<{
   source: CheckSource | null;
   error: string | null;
   kinds: string | null;
-  role_ids: string;
-}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, kinds, role_ids FROM channels ORDER BY rowid");
+}>("SELECT id, handle, name, enabled, checked_at, upcoming_count, live_count, source, error, kinds FROM channels ORDER BY rowid");
 const linkRows = query<{ channel_id: string; webhook_id: string }>("SELECT channel_id, webhook_id FROM channel_webhooks");
 const manualRows = query<{ channel_id: string; video_id: string; added_at: number }>(
   "SELECT channel_id, video_id, added_at FROM manual_videos ORDER BY added_at",
@@ -89,7 +88,6 @@ export function overview(): Overview {
       error: c.error,
       webhookIds: (links[c.id] ?? []).map((l) => l.webhook_id),
       kinds: kindsDto(c.kinds),
-      roleIds: parseRoleIds(c.role_ids),
       manualVideos: (manual[c.id] ?? []).map((v) => ({ videoId: v.video_id, addedAt: v.added_at })),
     })),
     webhooks: webhookRows.all().map((w) => ({

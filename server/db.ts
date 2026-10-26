@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { CONTENT_KINDS, MAX_INTERVAL_MS, MAX_MESSAGE_LENGTH, MIN_INTERVAL_MS, ROLE_ID_RE } from "../shared/contract.ts";
+import { CONTENT_KINDS, MAX_INTERVAL_MS, MAX_MESSAGE_LENGTH, MIN_INTERVAL_MS } from "../shared/contract.ts";
 import type { ContentKind, SourceName } from "../shared/contract.ts";
 
 export const DB_FILE = resolve(process.env.DB_PATH || "data/app.db");
@@ -129,6 +129,29 @@ const MIGRATIONS: readonly { version: number; up: () => void }[] = [
       }
     },
   },
+  {
+    // Mentions are written the Discord way inside the message (`<@&roleId>`), so the separate role list is gone.
+    // Every `@{roleid}` becomes the mentions of the roles that channel had saved, then the column is dropped.
+    version: 4,
+    up() {
+      if (!hasColumn("channels", "role_ids")) return;
+      const rows = db.prepare("SELECT id, kinds, role_ids FROM channels WHERE kinds IS NOT NULL").all() as unknown as { id: string; kinds: string; role_ids: string }[];
+      const save = db.prepare("UPDATE channels SET kinds = ? WHERE id = ?");
+      for (const row of rows) {
+        const mentions = row.role_ids.split(",").filter((id) => /^\d{17,20}$/.test(id)).map((id) => `<@&${id}>`).join(" ");
+        try {
+          const kinds = JSON.parse(row.kinds) as Record<string, { message?: unknown } | undefined>;
+          for (const entry of Object.values(kinds)) {
+            if (typeof entry?.message === "string") entry.message = entry.message.replace(/@\{roleid\}/gi, mentions);
+          }
+          save.run(JSON.stringify(kinds), row.id);
+        } catch {
+          // damaged JSON is read as defaults anyway; nothing to convert
+        }
+      }
+      db.exec("ALTER TABLE channels DROP COLUMN role_ids");
+    },
+  },
 ];
 
 const LATEST_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
@@ -213,9 +236,6 @@ export function getIntervalMs(): number {
   const ms = candidates.find((n) => Number.isFinite(n) && n > 0) ?? DEFAULT_INTERVAL_MS;
   return Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, ms));
 }
-
-// Stored as "id,id"; anything that is not a role id is dropped on read, so a damaged row can never inject a mention.
-export const parseRoleIds = (raw: string | null): string[] => (raw ?? "").split(",").filter((id) => ROLE_ID_RE.test(id));
 
 export interface KindSetting {
   enabled: boolean;

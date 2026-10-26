@@ -9,11 +9,9 @@ export const MAX_MESSAGE_LENGTH = 1000;
 export const CONTENT_KINDS = ["upcoming", "live", "vod", "short"] as const;
 export type ContentKind = (typeof CONTENT_KINDS)[number];
 export const KIND_LABEL: Record<ContentKind, string> = { upcoming: "Upcoming", live: "Live", vod: "VOD", short: "Shorts" };
-export const MAX_ROLES_PER_CHANNEL = 10;
 export const MAX_MANUAL_VIDEOS = 10; // per channel
 
 export const HANDLE_RE = /^@[A-Za-z0-9._-]{3,30}$/;
-export const ROLE_ID_RE = /^\d{17,20}$/; // Discord snowflake
 export const VIDEO_ID_RE = /^[\w-]{11}$/;
 export const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 export const WEBHOOK_RE =
@@ -63,10 +61,6 @@ const message = z
   .nullable()
   .transform((s) => s?.trim() || null);
 const kindPatch = z.object({ enabled: z.boolean().optional(), message: message.optional() });
-const roleIds = z
-  .array(z.string().trim().regex(ROLE_ID_RE, "A role id is 17 to 20 digits"))
-  .max(MAX_ROLES_PER_CHANNEL, `At most ${MAX_ROLES_PER_CHANNEL} roles per channel`)
-  .transform((ids) => [...new Set(ids)]);
 const videoRef = z
   .string()
   .trim()
@@ -87,7 +81,6 @@ export const schemas = {
     enabled: z.boolean().optional(),
     webhookIds: webhookIds.optional(),
     kinds: z.object({ upcoming: kindPatch.optional(), live: kindPatch.optional(), vod: kindPatch.optional(), short: kindPatch.optional() }).optional(),
-    roleIds: roleIds.optional(),
   }),
   manualVideoCreate: z.object({ url: videoRef }),
   webhookCreate: z.object({ name, url: z.string().trim().regex(WEBHOOK_RE, "Invalid Discord webhook URL") }),
@@ -133,7 +126,7 @@ export interface ManualVideoDto {
 
 export interface KindSettingDto {
   enabled: boolean; // announce this kind for the channel
-  message: string | null; // custom Discord text; `{user}` = the handle, `@{roleid}` = the roles of the channel
+  message: string | null; // custom Discord text; `{user}` = the handle; Discord mentions (`<@&roleId>`, `<@userId>`, `@everyone`, `@here`) ping
 }
 
 export interface ChannelDto {
@@ -148,7 +141,6 @@ export interface ChannelDto {
   error: string | null;
   webhookIds: string[];
   kinds: Record<ContentKind, KindSettingDto>;
-  roleIds: string[];
   manualVideos: ManualVideoDto[];
 }
 
