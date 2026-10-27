@@ -272,7 +272,7 @@ app.post("/api/webhooks/:id/test", async (c) => {
   const hook = webhookRow.get(paramId(c));
   if (!hook) throw HttpError(404, "Webhook not found");
   const video = { videoId: "dQw4w9WgXcQ", title: "Test Stream Notification", status: "upcoming" as const, startAt: Math.floor(Date.now() / 1000) + 3600 };
-  const thumbnail = `https://i.ytimg.com/vi/${video.videoId}/maxresdefault.jpg`;
+  const thumbnail = await thumbnailFor(video.videoId);
   try {
     await postWebhook(hook.url, buildPayload({ channelName: "Stream Watch test", handle: "@YouTube", video, thumbnail }));
   } catch (err) {

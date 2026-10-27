@@ -353,12 +353,16 @@ export async function lookupStreams(channel: ChannelRef, { force, manualIds }: L
  */
 export async function thumbnailFor(videoId: string): Promise<string> {
   const version = `?v=${Math.floor(Date.now() / 1000)}`;
-  const max = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg${version}`;
-  try {
-    const res = await ytFetch(max, { method: "HEAD", redirect: "error", timeoutMs: 2500 });
-    if (res.status === 404) return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg${version}`;
-  } catch {
-    // Network hiccup: send the max-res URL, Discord falls back to no image rather than failing the message.
+  const url = (size: string) => `https://i.ytimg.com/vi/${videoId}/${size}.jpg`;
+  // Any non-2xx answer (not only 404) moves on to the next size. `hqdefault` exists for every video, so it is the last resort.
+  for (const size of ["maxresdefault", "sddefault"]) {
+    try {
+      const res = await ytFetch(url(size), { method: "HEAD", redirect: "error", timeoutMs: 2500 });
+      await res.body?.cancel().catch(() => {});
+      if (res.ok) return `${url(size)}${version}`;
+    } catch {
+      break; // Could not check (offline, timeout): do not gamble on a size that may not exist.
+    }
   }
-  return max;
+  return `${url("hqdefault")}${version}`;
 }
